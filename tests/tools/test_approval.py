@@ -1395,10 +1395,15 @@ class TestDetectSudoStdin:
             "sudo whoami",
             "sudo -i",
             "sudo -u root -i",
-            # `--set-home` / `--shell` share no prefix with `--stdin` beyond
-            # "--s", so the broadened `--st[a-z]*` pattern must not catch them.
+            # `--set-home` shares no prefix with `--stdin`/`--shell` beyond
+            # "--s", so the broadened `--st[a-z]*`/`--sh[a-z]*` patterns must
+            # not catch it. (`sudo --shell id` used to sit in this list too,
+            # but `--shell` is itself a privilege-relevant flag per this
+            # class's own docstring above -- it was an oversight, not a
+            # policy stance, caught by t_4209213f. It now belongs with
+            # test_canonical_pipe_to_sudo_S_detected; see
+            # test_approval_sudo_wrapped_program_flags.py for full coverage.)
             "sudo --set-home id",
-            "sudo --shell id",
             "man sudo",
             "which sudo",
             "echo SUDO_USER=$SUDO_USER",
