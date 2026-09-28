@@ -42,6 +42,24 @@ _HERMES_CHILD_ALLOWED = frozenset({
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV", "HERMES_DELEGATED_CHILD_CONTEXT",
 })
 
+# Per-command agent-attribution markers (t_ceac3206, 2026-09-28). Deliberately
+# a SEPARATE, narrow, exact-name set from _HERMES_CHILD_ALLOWED above, not a
+# widening of it or of _SAFE_ENV_PREFIXES: these two names carry no secret and
+# no config value (HERMES_AGENT is literally "true"; AI_AGENT is the public
+# agent-harness registry id "hermes-agent" — see hermes_cli/main.py's
+# _advertise_agent_env), so admitting them does not reopen the isolation this
+# file exists for. They were previously dropped like any other non-allowlisted
+# HERMES_*/bare var, which silently defeated grants.py's own in-process
+# self-mint check (_agent_mediated()) for exactly the shape that check exists
+# to catch: `execute_code` running `import grants; grants.issue(...)` in-process
+# saw neither var, so the runtime refusal never fired — verified by reading
+# _agent_mediated() and confirming it is the ONLY consumer of either exact name
+# anywhere in this codebase (grep, not assumed), so this addition has exactly
+# one behavioural effect: that check now fires correctly for execute_code
+# children too, same as it already does for every terminal-tool invocation.
+# See GRANTS-LOCKDOWN.md and grants.py::_agent_mediated() for the full design.
+_AGENT_ATTRIBUTION_ALLOWED = frozenset({"HERMES_AGENT", "AI_AGENT"})
+
 # Windows-only: without these the CRT itself fails — socket.socket() raises
 # WinError 10106 (Winsock can't find mswsock.dll) and subprocess can't resolve
 # cmd.exe. Well-known OS paths, not secrets; the substring block still runs.
@@ -88,6 +106,7 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None, toolchain
             continue
         if (any(k.startswith(p) for p in _SAFE_ENV_PREFIXES) or k in toolchain
                 or k in _HERMES_CHILD_ALLOWED
+                or k in _AGENT_ATTRIBUTION_ALLOWED
                 or (is_windows and k.upper() in _WINDOWS_ESSENTIAL_ENV_VARS)):
             scrubbed[k] = v
         elif k.startswith("HERMES_"):
