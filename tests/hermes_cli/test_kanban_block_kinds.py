@@ -86,6 +86,45 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_unblock_from_triage_lands_ready_and_resets_recurrences(kanban_home: Path) -> None:
+    """t_30d54f48: before this fix, ``unblock_task`` only matched
+    ``('blocked', 'scheduled')``. A card the loop-breaker routed to
+    ``triage`` could never be unblocked at all — ``unblock_task`` returned
+    ``False``, wrote no ``unblocked`` event, and the next same-kind re-block
+    would have landed straight back in ``triage`` even if it somehow had.
+    This is the ground-truth regression: Scott's ``/kanban unblock`` on a
+    triage-routed card must actually move it, and must reset the
+    recurrence counter so the SAME cause doesn't re-trip the breaker on the
+    very next block.
+    """
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        tripped = kb.get_task(conn, tid)
+        assert (tripped.status, tripped.block_kind, tripped.block_recurrences) == (
+            "triage", "capability", 2)
+
+        ok = kb.unblock_task(conn, tid)
+        assert ok, "unblock_task must succeed on a triage-routed card"
+        after = kb.get_task(conn, tid)
+        assert after.status == "ready"
+        assert after.block_recurrences == 0, (
+            "recurrence counter must reset on a triage exit, or the very "
+            "next same-kind block re-trips the breaker immediately")
+        unblocked_events = [e for e in kb.list_events(conn, tid) if e.kind == "unblocked"]
+        assert unblocked_events, "unblock_task must write a real unblocked event from triage"
+
+        # And the reset must actually hold: one more same-kind cycle must
+        # NOT immediately re-trip (recurrence resets to 1, not 3).
+        kb.claim_task(conn, tid, claimer="worker")
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        once_more = kb.get_task(conn, tid)
+        assert (once_more.status, once_more.block_recurrences) == ("blocked", 1)
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
