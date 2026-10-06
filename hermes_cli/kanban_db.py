@@ -3558,17 +3558,43 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    """``blocked``/``scheduled``/``triage`` -> its resumable phase (parent
+    re-gated; ``review`` when that is where it left off), closing any leaked
+    run first.
+
+    ``triage`` (t_30d54f48): a task lands here only via the unblock-loop
+    breaker (``_route_block`` at ``BLOCK_RECURRENCE_LIMIT``) — there is no
+    other producer of that status for an already-running card. Before this
+    fix, ``unblock_task`` only matched ``('blocked', 'scheduled')``, so a
+    genuine operator ``/kanban unblock`` on a triage-routed card silently did
+    NOTHING (``rowcount == 0`` -> ``False``): no status change, no
+    ``unblocked`` event, nothing for ``board_grants.find_board_grant`` to
+    ever read. Scott's approval-by-unblock was structurally unreachable for
+    any card that had tripped the breaker — which is exactly the two live
+    victims this card was filed for (tech t_9f43a6f7, harness t_4b35b35b).
+
+    ``block_recurrences`` is reset to 0 ONLY when the task was in ``triage``.
+    This does not reopen the "amnesia" hole the comment below warns about:
+    that hole is about a *cron* silently unblocking a ``blocked`` card over
+    and over, which still preserves the counter here exactly as before.
+    Reaching ``triage`` already REQUIRES a human/operator-issued unblock
+    (workers cannot call ``kanban_unblock`` at all — orchestrator-only), so
+    arriving here and then being explicitly unblocked again is the human
+    decision point the breaker was built to force. Without the reset, the
+    very next same-kind re-block would recompute
+    ``prev_recurrences + 1 >= BLOCK_RECURRENCE_LIMIT`` and land back in
+    ``triage`` immediately — the same permanent trap one layer down.
+    """
     now = int(time.time())
     with write_txn(conn):
+        prior_status = _task_status(conn, task_id)
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if prior_status in ("blocked", "triage")
             else "ready"
         )
         _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            conn, task_id, statuses=("blocked", "scheduled", "triage"), now=now,
             note="invariant recovery on unblock",
         )
         # Re-gate on parent completion before restoring the source phase.
@@ -3578,15 +3604,21 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # ``block_kind``/``block_recurrences`` deliberately survive the unblock:
-        # resetting them is the amnesia that let cron-unblock <-> re-block loop
-        # unbounded; only complete_task clears them. ``consecutive_failures``
-        # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
-        # is a fresh start for the retry budget.
+        # ``block_kind``/``block_recurrences`` deliberately survive an ordinary
+        # unblock out of ``blocked``: resetting them is the amnesia that let
+        # cron-unblock <-> re-block loop unbounded; only complete_task clears
+        # them in that path. A ``triage`` exit resets ``block_recurrences``
+        # for the reason in the docstring above — it is the one unblock that
+        # already proves a human looked at the loop. ``consecutive_failures``
+        # (the dispatcher's spawn/crash counter) IS reset either way — a
+        # deliberate unblock is a fresh start for the retry budget.
+        recurrence_reset_sql = ", block_recurrences = 0" if prior_status == "triage" else ""
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "consecutive_failures = 0, last_failure_error = NULL"
+            + recurrence_reset_sql
+            + " WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')",
+            (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
