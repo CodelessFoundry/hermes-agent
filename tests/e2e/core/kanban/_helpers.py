@@ -104,6 +104,16 @@ class Board:
             # HOME's own state.db; the whole tree is under ``root`` (asserted below), so let workers
             # open their real session store.
             "HERMES_STATE_DB_GUARD_BYPASS": "1",
+            # Without this, every ``hermes`` invocation below runs hermes_cli.main's
+            # prepare_launch() self-update path against THIS LIVE CHECKOUT (install_root()
+            # ignores HOME/HERMES_HOME). That path resolves the managed-Python *store* via
+            # get_default_hermes_root(), which DOES follow the scratch HERMES_HOME above, and
+            # republishes the checkout's real .hermes/bin/hermes launcher to exec that scratch
+            # tmp dir's Python. Once pytest deletes the tmp dir, the live launcher is a dangling
+            # exec and every real kanban worker dies with exit 127 (5 Oct outage, root-caused in
+            # t_f312342c). Every other e2e helper in this suite already sets this; this file was
+            # the one gap.
+            "HERMES_DISABLE_LAZY_INSTALLS": "1",
             **FAST_ENV, **self.env_extra,
         })
         assert env["HERMES_HOME"].startswith(str(self.root))
