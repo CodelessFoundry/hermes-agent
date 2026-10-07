@@ -248,6 +248,58 @@ def _quiet_noisy_loggers() -> None:
     """Pin noisy third-party loggers at WARNING."""
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+    _install_benign_ws_keepalive_timeout_filter()
+
+
+# The legacy `websockets` server protocol (still what uvicorn<0.50's ws="auto" resolves to —
+# see uvicorn/protocols/websockets/auto.py) runs its keepalive ping on every open server
+# connection. When a dashboard WS client (browser tab, Desktop app, a laptop that slept
+# mid-tunnel — see the #101626 comment in hermes_cli/web_server.py's _build_uvicorn_server)
+# misses a pong, the legacy protocol's close_connection() task raises ConnectionClosedError
+# *inside* a task wrapped in `asyncio.shield()`. Nothing awaits that shielded future directly,
+# so asyncio's own default exception handler logs it at ERROR via the "asyncio" logger —
+# this is the library's documented, benign behavior (see python-websockets and
+# Kludex/uvicorn upstream threads), not a Hermes bug: the socket is retired and the client
+# reconnects normally. Matched upstream projects hitting the exact same noise (Prefect
+# #22090, Baserow #5224) fixed it the same way: suppress only this one benign shape at the
+# logging layer, so every OTHER unhandled asyncio error still surfaces at ERROR (#<task t_ee74b8ee>).
+_BENIGN_WS_KEEPALIVE_TIMEOUT_MESSAGE = "ConnectionClosedError exception in shielded future"
+_BENIGN_WS_KEEPALIVE_TIMEOUT_REASON = "keepalive ping timeout"
+
+
+class _BenignWSKeepaliveTimeoutFilter(logging.Filter):
+    """Demote the legacy-websockets keepalive-ping-timeout shielded-future log to DEBUG.
+
+    Matches only the exact benign shape (message prefix AND the keepalive-ping-timeout close
+    reason in the formatted text); every other "asyncio" logger record — including a
+    ConnectionClosedError for a different reason — passes through unchanged at its original
+    level. DEBUG (not dropped) keeps it visible to --verbose/setup_verbose_logging() for anyone
+    actively chasing websocket behavior; INFO-level agent.log and WARNING-level errors.log
+    (the files an operator actually reads day to day) stop seeing it as noise.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno < logging.ERROR:
+            return True
+        try:
+            text = record.getMessage()
+        except Exception:
+            return True
+        if not text.startswith(_BENIGN_WS_KEEPALIVE_TIMEOUT_MESSAGE):
+            return True
+        if _BENIGN_WS_KEEPALIVE_TIMEOUT_REASON not in text:
+            return True  # a different close reason is a real surprise; keep it loud
+        record.levelno = logging.DEBUG
+        record.levelname = "DEBUG"
+        return True
+
+
+def _install_benign_ws_keepalive_timeout_filter() -> None:
+    """Idempotent: attach :class:`_BenignWSKeepaliveTimeoutFilter` to the "asyncio" logger once."""
+    asyncio_logger = logging.getLogger("asyncio")
+    if any(isinstance(f, _BenignWSKeepaliveTimeoutFilter) for f in asyncio_logger.filters):
+        return
+    asyncio_logger.addFilter(_BenignWSKeepaliveTimeoutFilter())
 
 
 def set_session_context(session_id: str) -> None:
