@@ -29,8 +29,15 @@ class RoomMember(OpenModel):
 
 
 class RoomActor(Result):
+    """``gateway/hosted_rooms.py::_validate_actor`` / ``_OPTIONAL_ACTOR_FIELDS``: every actor has
+    ``kind``/``id``; a member actor also carries ``profile`` (always) and, when present,
+    ``display_name`` and ``connection_id`` (``hosted_room_discussion.py::_member_actor``)."""
+
     kind: str
     id: str
+    display_name: str | None = None
+    profile: str | None = None
+    connection_id: str | None = None
 
 
 class RoomEvent(Result):

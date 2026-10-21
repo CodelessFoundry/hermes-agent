@@ -1553,9 +1553,13 @@ export interface RoomEvent {
   created_at: number
   idempotent?: boolean
 }
+/** ``gateway/hosted_rooms.py::_validate_actor`` / ``_OPTIONAL_ACTOR_FIELDS``: every actor has ``kind``/``id``; a member actor also carries ``profile`` (always) and, when present, ``display_name`` and ``connection_id`` (``hosted_room_discussion.py::_member_actor``). */
 export interface RoomActor {
   kind: string
   id: string
+  display_name?: string | null
+  profile?: string | null
+  connection_id?: string | null
 }
 export interface GroupsCreateParams {
   profile?: string | null

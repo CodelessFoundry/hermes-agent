@@ -33634,6 +33634,7 @@
       },
       "RoomActor": {
         "additionalProperties": false,
+        "description": "``gateway/hosted_rooms.py::_validate_actor`` / ``_OPTIONAL_ACTOR_FIELDS``: every actor has\n``kind``/``id``; a member actor also carries ``profile`` (always) and, when present,\n``display_name`` and ``connection_id`` (``hosted_room_discussion.py::_member_actor``).",
         "properties": {
           "kind": {
             "title": "Kind",
@@ -33642,6 +33643,42 @@
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Display Name"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          },
+          "connection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Connection Id"
           }
         },
         "required": [
