@@ -399,6 +399,25 @@ def _anthropic_cfg_base_url(model_cfg: dict[str, Any]) -> str:
     return cfg_base_url if _anthropic_base_url_override_ok(cfg_base_url) else ""
 
 
+def _anthropic_model_cooldown_retry_after(model: str) -> float | None:
+    """Seconds until *model*'s pool cooldown lifts, or ``None`` when unknown.
+
+    Feeds :class:`AuthError`'s ``retry_after`` so a cron job hitting this wall carries the
+    same "retry after <N>s" shape Codex's quota AuthError already does — without it,
+    ``cron/quota_hold.py``'s ``hold_seconds_from_failure`` (which only reads
+    ``AuthError.retry_after`` or a "retry after Ns" string) never engages, and the job keeps
+    re-firing into a window it cannot pass (t_317282ed BUILD #2). Best-effort: a pool read
+    failure here must never block the AuthError this wraps, since that error is itself the
+    correct behaviour for a benched credential.
+    """
+    import time
+    try:
+        until = load_pool("anthropic").next_available_at(model=model)
+    except Exception:
+        return None
+    return max(until - time.time(), 0.0) if until is not None else None
+
+
 def _anthropic_token_or_raise(*, model: str | None = None) -> str:
     from agent.anthropic_credentials import resolve_anthropic_token
     token = resolve_anthropic_token(model=model)
@@ -414,7 +433,8 @@ def _anthropic_token_or_raise(*, model: str | None = None) -> str:
             raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
                             "other Claude models remain available (see `hermes auth list`).",
                             provider="anthropic", code=CODEX_RATE_LIMITED_CODE,
-                            relogin_required=False, retryable=True)
+                            relogin_required=False, retryable=True,
+                            retry_after=_anthropic_model_cooldown_retry_after(model))
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
     return token
 
