@@ -166,10 +166,11 @@ def test_notify_single_query_session_finalize_awaits_background_review_first(mon
         cli, "_await_background_review_before_session_close",
         lambda agent: calls.append(("await_review", agent)),
     )
-    monkeypatch.setattr(
-        cli, "_notify_session_finalize",
-        lambda **kwargs: calls.append(("finalize", kwargs)),
-    )
+    def _fake_notify_session_finalize(**kwargs):
+        calls.append(("finalize", kwargs))
+        return []  # the real one yields stderr messages; _notify_single_query_session_finalize iterates it
+
+    monkeypatch.setattr(cli, "_notify_session_finalize", _fake_notify_session_finalize)
 
     cli._notify_single_query_session_finalize(fake_cli)
 
