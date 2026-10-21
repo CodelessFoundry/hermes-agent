@@ -207,7 +207,7 @@ def test_hold_provider_from_failure_reads_provider_off_the_auth_error():
     assert qh.hold_provider_from_failure(relogin) is None
 
 
-def test_anthropic_quota_hold_parks_job_and_shows_paused_not_error(tmp_cron_home):
+def test_anthropic_quota_hold_parks_job_and_shows_paused_not_error(tmp_cron_home, cron_owner):
     """t_317282ed BUILD #2: an Anthropic per-model usage wall must (a) park the job past the
     window exactly like Codex's does — the hold mechanics in cron/quota_hold.py are provider-
     agnostic — but (b) render as last_status='paused_usage_limit', not the red 'error' status
@@ -215,7 +215,13 @@ def test_anthropic_quota_hold_parks_job_and_shows_paused_not_error(tmp_cron_home
     fix, the AuthError _anthropic_token_or_raise raised for a rate-limited model carried no
     retry_after at all, so hold_seconds_from_failure never matched and the job just kept
     re-firing into the wall every cadence tick."""
-    job = create_job("anthropic digest", "every 30m", deliver="local")
+    # A real (non-local) lane: the alert rides the durable delivery queue, whose enqueue is the
+    # seam (same reasoning as test_quota_hold_parks_past_window_... above) — "local" delivery
+    # bypasses cron/delivery_queue.py entirely (scheduler.py's "== local: return" short-circuit),
+    # so asserting against the mocked enqueue on a local-lane job would never see a delivery.
+    (tmp_cron_home / "config.yaml").write_text(
+        "platforms:\n  slack:\n    enabled: true\n    token: xoxb-test\n", encoding="utf-8")
+    job = create_job("anthropic digest", "every 30m", deliver="slack:alerts")
     job_id = job["id"]
     now = datetime.now(timezone.utc)
     deliveries: list = []
