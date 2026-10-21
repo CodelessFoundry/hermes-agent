@@ -24,7 +24,7 @@ from agent.credential_pool import (  # custom_provider_pool_key_candidates is re
 )
 from agent.secret_scope import get_secret_str
 from hermes_cli.auth import (  # resolve_external_process_provider_credentials is read via origin by runtime_provider_backends
-    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, AuthError, DEFAULT_CODEX_BASE_URL, DEFAULT_QWEN_BASE_URL, DEFAULT_XAI_OAUTH_BASE_URL,
+    ACTUAL_LOCAL_NOAUTH_PLACEHOLDER, AuthError, CODEX_RATE_LIMITED_CODE, DEFAULT_CODEX_BASE_URL, DEFAULT_QWEN_BASE_URL, DEFAULT_XAI_OAUTH_BASE_URL,
     PROVIDER_REGISTRY, _agent_key_is_usable, _nous_inference_env_override, format_auth_error, resolve_provider,
     resolve_nous_runtime_credentials, resolve_codex_runtime_credentials, resolve_xai_oauth_runtime_credentials,
     resolve_qwen_runtime_credentials, resolve_api_key_provider_credentials,
@@ -405,9 +405,16 @@ def _anthropic_token_or_raise(*, model: str | None = None) -> str:
     if not token:
         # A key the pool benched for *this* model is not a missing credential; telling the
         # user to re-authenticate would send them chasing a cooldown that lifts on its own.
+        #
+        # This is a quota wall, so it MUST carry the transient rate-limit code. Without it
+        # `is_rate_limited_auth_error()` returns False and a Kanban worker that hit a 429
+        # exits 1 instead of KANBAN_RATE_LIMIT_EXIT_CODE — the dispatcher then books a
+        # provider outage as the task's own failure and burns its retry budget (#124xxx).
         if model and resolve_anthropic_token():
             raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
-                            "other Claude models remain available (see `hermes auth list`).")
+                            "other Claude models remain available (see `hermes auth list`).",
+                            provider="anthropic", code=CODEX_RATE_LIMITED_CODE,
+                            relogin_required=False, retryable=True)
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
     return token
 

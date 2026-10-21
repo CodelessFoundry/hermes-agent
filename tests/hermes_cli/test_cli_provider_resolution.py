@@ -429,6 +429,56 @@ def test_ensure_runtime_credentials_records_quota_vs_bad_key(monkeypatch, tmp_pa
     assert bad_shell._credentials_rate_limited is False
 
 
+def test_anthropic_model_cooldown_raises_a_rate_limited_auth_error(monkeypatch):
+    """A per-model Anthropic cooldown is a QUOTA wall, and must be typed as one.
+
+    After a 429 the retry loop benches the credential for that model, so the NEXT
+    turn's credential resolve finds no token and `_anthropic_token_or_raise` raises.
+    That AuthError used to carry no `code`, so `is_rate_limited_auth_error()` said
+    False, `_credentials_rate_limited` stayed False, and a Kanban worker exited 1 —
+    the dispatcher then counted a provider outage against `kanban.failure_limit`
+    and abandoned the card as `gave_up`.
+    """
+    from hermes_cli.auth import CODEX_RATE_LIMITED_CODE, AuthError, is_rate_limited_auth_error
+    from hermes_cli import runtime_provider
+
+    # Benched for THIS model only: model-scoped resolve fails, unscoped still works.
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.resolve_anthropic_token",
+        lambda *, model=None: None if model else "sk-ant-oat01-token",
+    )
+
+    with pytest.raises(AuthError) as exc_info:
+        runtime_provider._anthropic_token_or_raise(model="claude-opus-5")
+
+    err = exc_info.value
+    assert "rate-limited" in str(err)
+    assert err.code == CODEX_RATE_LIMITED_CODE
+    assert err.relogin_required is False
+    # The whole point: the classifier the CLI uses must recognise it.
+    assert is_rate_limited_auth_error(err) is True
+
+
+def test_missing_anthropic_credentials_is_not_mistaken_for_a_quota_wall(monkeypatch):
+    """Negative control for the test above: no credentials at all is a REAL auth failure.
+
+    It must keep exit 1 and keep counting against the retry budget — a fix that made
+    every credential error look transient would be worse than the bug.
+    """
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli import runtime_provider
+
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.resolve_anthropic_token",
+        lambda *, model=None: None,  # nothing resolves, scoped or not
+    )
+
+    with pytest.raises(AuthError) as exc_info:
+        runtime_provider._anthropic_token_or_raise(model="claude-opus-5")
+
+    assert is_rate_limited_auth_error(exc_info.value) is False
+
+
 
 
 
