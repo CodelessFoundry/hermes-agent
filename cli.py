@@ -51,6 +51,7 @@ from hermes_cli.cli_tui_runtime_mixin import CLITuiRuntimeMixin
 from hermes_cli.cli_shutdown import (
     _CLEANUP_STEPS,
     _arm_exit_watchdog,
+    _await_background_review_before_session_close,
     _emit_interrupted_session_end,
     _exit_watchdog_timeout,
     _finalize_single_query,

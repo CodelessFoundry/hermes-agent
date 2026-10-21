@@ -228,8 +228,26 @@ def _emit_interrupted_session_end(cli, *, reason: str = "keyboard_interrupt") ->
     )
 
 
+def _await_background_review_before_session_close(agent) -> None:
+    """Interrupt and await any in-flight background-review fork before the Relay session it
+    shares a session_id with gets hard-closed. One-shot CLI/kanban/cron processes exit right
+    after their single turn, but a post-turn review (agent._spawn_background_review) runs on a
+    daemon thread that opens its OWN Relay turn scope under the SAME session_id — nothing else
+    in the exit path waits for it. Closing the session while that scope is still open force-drains
+    it ("drained N orphaned scope(s)") and the review's own end_turn() then fails with "session is
+    closing" when it finally runs. cancel_background_review_for_live_turn() is the existing,
+    bounded (2s, fail-open), idempotent primitive for exactly this overlap — it already runs at
+    the START of every new live turn; this is the same call at the END of the LAST one. Best-effort:
+    never block process exit on it."""
+    if agent is None:
+        return
+    with suppress(Exception):
+        from agent.background_review import cancel_background_review_for_live_turn
+        cancel_background_review_for_live_turn(agent)
+
+
 def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> None:
-    from cli import _notify_session_finalize, _oneshot_agent_and_session
+    from cli import _await_background_review_before_session_close, _notify_session_finalize, _oneshot_agent_and_session
     agent, session_id = _oneshot_agent_and_session(cli)
     if session_id in _cli()._single_query_finalize_attempted_session_ids:
         return
@@ -238,6 +256,7 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
     if session_id in _cli()._handed_off_session_ids or _gateway_owns_session_end(agent):
         return
 
+    _await_background_review_before_session_close(agent)
     try:
         # stderr: one-shot stdout is the answer scripts parse.
         for message in _notify_session_finalize(
