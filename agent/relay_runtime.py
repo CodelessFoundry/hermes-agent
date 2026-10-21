@@ -1129,7 +1129,8 @@ class RelaySessionCoordinator:
         """Pop the turn's logical LLM children, then the turn scope itself (LIFO)."""
         self._finish_logical_calls(turn, outcome=outcome)
         failure = host._close_scope_handle(
-            turn.lease.session, turn.handle, output={"outcome": outcome}, failure_label="turn scope close failed",
+            turn.lease.session, turn.handle, output={"outcome": outcome}, allow_closing=True,
+            failure_label="turn scope close failed",
         )
         if failure:
             logger.warning("Hermes Relay turn finalization failed: %s", failure)
@@ -1204,7 +1205,7 @@ class RelaySessionCoordinator:
         while logical_calls:
             _request_id, logical_handle = logical_calls[-1]
             failure = host._close_scope_handle(
-                lease.session, logical_handle, output={"outcome": outcome},
+                lease.session, logical_handle, output={"outcome": outcome}, allow_closing=True,
                 failure_label="logical LLM scope close failed",
             )
             if failure is None:
