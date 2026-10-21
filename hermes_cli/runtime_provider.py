@@ -399,23 +399,38 @@ def _anthropic_cfg_base_url(model_cfg: dict[str, Any]) -> str:
     return cfg_base_url if _anthropic_base_url_override_ok(cfg_base_url) else ""
 
 
-def _anthropic_model_cooldown_retry_after(model: str) -> float | None:
-    """Seconds until *model*'s pool cooldown lifts, or ``None`` when unknown.
+# t_0d53d772: when the pool can't compute a precise reset time, fall back to this cheap-poll
+# interval rather than None — matches t_317282ed BUILD #1's original spec ("record reset time
+# from the response headers when present, else poll cheaply every 30 min").
+_ANTHROPIC_COOLDOWN_UNKNOWN_FALLBACK_SECONDS = 1800.0
+
+
+def _anthropic_model_cooldown_retry_after(model: str) -> float:
+    """Seconds until *model*'s pool cooldown lifts. Always positive.
 
     Feeds :class:`AuthError`'s ``retry_after`` so a cron job hitting this wall carries the
     same "retry after <N>s" shape Codex's quota AuthError already does — without it,
     ``cron/quota_hold.py``'s ``hold_seconds_from_failure`` (which only reads
     ``AuthError.retry_after`` or a "retry after Ns" string) never engages, and the job keeps
-    re-firing into a window it cannot pass (t_317282ed BUILD #2). Best-effort: a pool read
-    failure here must never block the AuthError this wraps, since that error is itself the
-    correct behaviour for a benched credential.
+    re-firing into a window it cannot pass (t_317282ed BUILD #2).
+
+    This is called only after ``_anthropic_token_or_raise`` has already confirmed *model* is
+    blocked (the unscoped resolve succeeded but the model-scoped one returned None), so a pool
+    read that can't produce a precise number — ``next_available_at`` returning ``None``, or a
+    read exception — is not "no wait needed"; it means the pool just can't say exactly how long,
+    and must still return a positive fallback. Returning ``None``/``0`` here was the actual
+    regression (t_0d53d772): the AuthError's ``retry_after`` went missing, so
+    ``hold_seconds_from_failure`` could never engage and the run fell through to a bare
+    ``RuntimeError``/"error" status instead of the pause-and-resume ``paused_usage_limit`` one.
     """
     import time
     try:
         until = load_pool("anthropic").next_available_at(model=model)
     except Exception:
-        return None
-    return max(until - time.time(), 0.0) if until is not None else None
+        return _ANTHROPIC_COOLDOWN_UNKNOWN_FALLBACK_SECONDS
+    if until is None:
+        return _ANTHROPIC_COOLDOWN_UNKNOWN_FALLBACK_SECONDS
+    return max(until - time.time(), 0.0) or _ANTHROPIC_COOLDOWN_UNKNOWN_FALLBACK_SECONDS
 
 
 def _anthropic_token_or_raise(*, model: str | None = None) -> str:
