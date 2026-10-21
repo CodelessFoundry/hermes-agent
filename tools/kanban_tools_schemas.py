@@ -118,7 +118,15 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Free-form dict of structured facts about this "
                 "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                 "\"findings\": [...]}. Surfaced to downstream "
-                "workers alongside ``summary``."
+                "workers alongside ``summary``. Always include a "
+                "``retro`` sub-object: {\"went_well\": \"...\", "
+                "\"went_wrong\": \"... or none\", \"assumed_not_verified\": "
+                "\"anything you reported as true without checking at "
+                "the source, or none\", \"touched_outside_scope\": "
+                "\"shared config/credentials/other profiles' files/"
+                "services restarted, or none\", \"lesson\": \"one line a "
+                "future worker should know, or none\"}. Plain words, "
+                "no secrets."
         )),
         "result": _prop("string", (
                 "Short result log line (legacy field, maps to "
@@ -198,6 +206,18 @@ KANBAN_BLOCK_SCHEMA = _schema(
                 "The others surface to a human. Omit only if none apply."
             ),
         },
+        "metadata": _prop("object", (
+                "Free-form dict of structured facts about this attempt, "
+                "same convention as ``kanban_complete``'s ``metadata`` — "
+                "always include a ``retro`` sub-object: "
+                "{\"went_well\": \"...\", \"went_wrong\": \"... or none\", "
+                "\"assumed_not_verified\": \"anything you reported as true "
+                "without checking at the source, or none\", "
+                "\"touched_outside_scope\": \"shared config/credentials/"
+                "other profiles' files/services restarted, or none\", "
+                "\"lesson\": \"one line a future worker should know, or "
+                "none\"}. Plain words, no secrets."
+        )),
     },
     ["reason"],
 )

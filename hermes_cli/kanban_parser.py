@@ -322,6 +322,9 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _arg("--metadata",
+             help='JSON dict of structured facts (e.g. retro notes) to store on the '
+                  'closing run, same convention as `complete --metadata`.'),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
