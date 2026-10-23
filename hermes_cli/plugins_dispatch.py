@@ -52,8 +52,17 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.
+# ``on_session_start``/``on_session_end`` carry no ``tool_call_id``/``turn_id`` (the generic
+# fallback), so without an explicit entry here every session's boundary call collapses onto the
+# SAME gate key. Two sessions starting within the same callback's in-flight window (e.g. a
+# ``delegate_task`` batch spawning several subagent sessions at once) then race: the second
+# session's call sees the first session's still-in-flight worker holding that key and gets
+# skipped with "still running", even though nothing hung and the two calls are unrelated work
+# (observed live: 1 of 6 concurrent delegate_task subagent session starts silently dropped the
+# hook within the same ~12ms window; see hermes-agent kanban task t_ee597ae4 for the incident).
 _HOOK_CALL_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
     "pre_command": ("session_key",), "post_compaction": ("session_id",),
+    "on_session_start": ("session_id",), "on_session_end": ("session_id",),
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
