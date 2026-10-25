@@ -120,6 +120,19 @@ except ImportError:  # pragma: no cover - starlette is a required install path
     _WebSocketDisconnect = Exception  # type: ignore[assignment]
 
 
+def _is_benign_disconnect_send_error(exc: Exception) -> bool:
+    """True for the two shapes a send races a client disconnect into — the client already
+    left (``WebSocketDisconnect``), or the ASGI server already tore the socket down before this
+    send got scheduled (``RuntimeError`` from Starlette/uvicorn's "message after close" guard).
+    Both mean exactly the same thing operationally: the peer is gone, there is nothing left to
+    deliver to, and the existing ``handle_ws`` disconnect teardown (session detach/reap) already
+    runs independently of this send. Routine, not actionable — anything else (a real transport
+    fault, a bug) stays at WARNING. See t_ee5439b9."""
+    if isinstance(exc, _WebSocketDisconnect):
+        return True
+    return isinstance(exc, RuntimeError) and "websocket.send" in str(exc) and "close" in str(exc)
+
+
 class WSTransport:
     """Per-connection WS transport. ``write`` is safe from any thread *other than* the loop thread owning the
     socket (pool workers marshal onto the loop and block on the future); from the loop thread itself it would
@@ -271,7 +284,15 @@ class WSTransport:
                 except Exception as exc:
                     # Latch while holding the writer lock so queued batches observe the failure first.
                     self._closed = True
-                    _log.warning("ws send failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
+                    if _is_benign_disconnect_send_error(exc):
+                        # Routine: the client already left (handle_ws's own receive-side teardown
+                        # handles session detach/reap independently of this send failing). Keep the
+                        # signal at DEBUG instead of paging WARNING-level monitors for every reload/
+                        # tab-close -- see t_ee5439b9.
+                        _log.debug("ws send skipped (peer already disconnected) peer=%s error_type=%s",
+                                   self._peer, type(exc).__name__)
+                    else:
+                        _log.warning("ws send failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
                     return
 
     def close(self) -> None:  # loop thread (handle_ws finally), so the TimerHandle is safe
