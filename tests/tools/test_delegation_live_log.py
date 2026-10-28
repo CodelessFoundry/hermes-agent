@@ -386,6 +386,61 @@ def test_parent_db_path_accepts_str_paths():
     assert _parent_live_home(parent) == Path("/prof")
 
 
+def test_worker_runtime_session_store_pins_own_home_at_debug(monkeypatch, caplog, tmp_path):
+    """A kanban/cron worker's ``_session_db`` is a RuntimeSessionStore IPC proxy
+    with no ``db_path`` — NOT the #91996 unresolved-parent case. The worker's own
+    HERMES_HOME is a process-scoped env var the dispatcher set once at spawn, so
+    it must be pinned explicitly (and quietly, at DEBUG) instead of falling
+    through to the "parent exposes no _session_db" WARNING (#152114)."""
+    import logging as _logging
+
+    from agent import runtime_session_store
+    from agent.runtime_session_store import RuntimeSessionStore
+    from tools.delegate_tool import _parent_live_home
+
+    monkeypatch.setattr(runtime_session_store, "_worker_process", True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    store = MagicMock(spec=RuntimeSessionStore)  # real type check must pass isinstance()
+    store.__class__ = RuntimeSessionStore
+    parent = MagicMock(spec=["_session_db"])
+    parent._session_db = store
+
+    with caplog.at_level(_logging.DEBUG, logger="tools.delegate_tool"):
+        home = _parent_live_home(parent)
+
+    assert home == tmp_path
+    assert not any(r.levelno >= _logging.WARNING for r in caplog.records), (
+        "the routine worker-process path must not be logged as a WARNING"
+    )
+    assert any("worker RuntimeSessionStore" in r.getMessage() for r in caplog.records)
+
+
+def test_non_worker_process_with_storelike_db_still_warns(monkeypatch, caplog, tmp_path):
+    """The worker-process carve-out must not swallow the genuine #91996 case:
+    outside a worker process (is_worker_process() False), an unresolvable
+    _session_db still falls through to the WARNING, not a silent happy path."""
+    import logging as _logging
+
+    from agent import runtime_session_store
+    from agent.runtime_session_store import RuntimeSessionStore
+    from tools.delegate_tool import _parent_live_home
+
+    monkeypatch.setattr(runtime_session_store, "_worker_process", False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    store = MagicMock(spec=RuntimeSessionStore)
+    store.__class__ = RuntimeSessionStore
+    parent = MagicMock(spec=["_session_db"])
+    parent._session_db = store
+
+    with caplog.at_level(_logging.DEBUG, logger="tools.delegate_tool"):
+        home = _parent_live_home(parent)
+
+    assert home is None
+    assert any(r.levelno == _logging.WARNING for r in caplog.records)
+
+
 def test_prune_sweeps_the_pinned_root_not_ambient(tmp_path, monkeypatch):
     """Retention must clean where the dispatch writes: stale dirs under the
     pinned home are removed by that home's dispatches; a stale dir under the
