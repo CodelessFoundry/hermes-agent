@@ -68,6 +68,20 @@ def _parent_live_home(parent_agent: Any) -> Optional[Path]:
     when the parent exposes no usable SessionDB — the caller then falls back
     to the ambient resolve, which is exactly the #91996 failure mode, so the
     skip is logged rather than silent.
+
+    A kanban/cron WORKER process is a different, safe case, not #91996: its
+    ``_session_db`` is a ``RuntimeSessionStore`` IPC proxy with no ``db_path``
+    (the real SessionDB lives in the owner process it talks to over RPC), but
+    the worker's own ``HERMES_HOME`` is a plain process env var the dispatcher
+    sets once at spawn for exactly one profile — it is never shared by, or
+    swapped mid-request across, multiple profiles the way the gateway's
+    single long-lived process is. #91996 was about a ContextVar override
+    getting dropped across a raw ``threading.Thread`` boundary inside that
+    shared process; a worker has no such boundary to drop, so ambient resolve
+    is provably correct here and is pinned explicitly (at DEBUG, not WARNING
+    — this is the routine path for every delegate_task call made from inside
+    a worker, not a degradation) instead of being lumped in with the genuine
+    no-session-handle case below (#152114).
     """
     parent_db = getattr(getattr(parent_agent, "_session_db", None), "db_path", None)
     # Concrete str/Path only — NOT the os.PathLike protocol: MagicMock (and any
@@ -84,6 +98,20 @@ def _parent_live_home(parent_agent: Any) -> Optional[Path]:
             parent_db,
         )
         return None
+    parent_session_db = getattr(parent_agent, "_session_db", None)
+    if parent_session_db is not None:
+        from agent.runtime_session_store import RuntimeSessionStore, is_worker_process
+        if is_worker_process() and isinstance(parent_session_db, RuntimeSessionStore):
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+            logger.debug(
+                "delegate_task: parent _session_db is a worker RuntimeSessionStore "
+                "(no db_path — the owner process holds the real SessionDB); pinning "
+                "to this worker's own process-scoped HERMES_HOME=%s instead of "
+                "treating it as an unresolved parent (#152114)",
+                home,
+            )
+            return home
     logger.warning(
         "delegate_task: parent agent exposes no _session_db; live-transcript "
         "home pinning skipped, falling back to ambient HERMES_HOME resolve "
