@@ -245,6 +245,10 @@ _SPECS = [
         _arg("--workflow-template-id", metavar="ID", help="Restrict to tasks with this workflow_template_id"),
         _arg("--step-key", dest="current_step_key", metavar="KEY",
              help="Restrict to tasks with this current_step_key"),
+        _arg("--overdue", action="store_true",
+             help="With --status scheduled: show only tasks whose stated SCHEDULED_UNTIL=<ISO8601> "
+                  "wake time (see `kanban schedule`) has passed, or whose token failed to parse. "
+                  "A scheduled task with no token is a deliberate indefinite park and never matches."),
     ], aliases=["ls"], help="List tasks"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),

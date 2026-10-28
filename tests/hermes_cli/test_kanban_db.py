@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import sqlite3
@@ -200,6 +201,81 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
 
         events = kb.list_events(conn, t)
         assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
+
+
+# ---------------------------------------------------------------------------
+# scheduled_wake_time / list_scheduled_overdue -- the read side of
+# SCHEDULED_UNTIL=<ISO8601>. schedule_task() deliberately never auto-
+# dispatches on this token (see its docstring); these are a report-only
+# surface, not a sweeper, so they must never mutate task status.
+# ---------------------------------------------------------------------------
+
+
+def test_scheduled_wake_time_no_token_is_a_deliberate_indefinite_park(kanban_home):
+    """A scheduled card with no SCHEDULED_UNTIL text (e.g. the `ideas` board's
+    funnel resting state) must report had_token=False, never a parse error."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="idea parked indefinitely", assignee="ops")
+        kb.schedule_task(conn, t, reason="revisit later, no particular date")
+        wake, had_token = kb.scheduled_wake_time(conn, t)
+        assert (wake, had_token) == (None, False)
+
+        # And also with no reason at all.
+        t2 = kb.create_task(conn, title="idea parked, no reason given", assignee="ops")
+        kb.schedule_task(conn, t2)
+        assert kb.scheduled_wake_time(conn, t2) == (None, False)
+
+
+def test_scheduled_wake_time_parses_token_with_and_without_trailing_z(kanban_home):
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="retry after reconnect", assignee="ops")
+        kb.schedule_task(conn, t, reason="SCHEDULED_UNTIL=2026-09-13T00:00:00Z waiting for reconnect")
+        wake, had_token = kb.scheduled_wake_time(conn, t)
+        assert had_token is True
+        assert wake == int(dt.datetime(2026, 9, 13, tzinfo=dt.timezone.utc).timestamp())
+
+        t2 = kb.create_task(conn, title="retry, explicit offset", assignee="ops")
+        kb.schedule_task(conn, t2, reason="SCHEDULED_UNTIL=2026-09-13T00:00:00+00:00")
+        wake2, had_token2 = kb.scheduled_wake_time(conn, t2)
+        assert had_token2 is True
+        assert wake2 == wake
+
+
+def test_scheduled_wake_time_unparseable_token_is_flagged_not_dropped(kanban_home):
+    """A malformed token must come back as had_token=True, wake=None -- a
+    future reason-text format change must degrade loud, not silent."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="malformed wake time", assignee="ops")
+        kb.schedule_task(conn, t, reason="SCHEDULED_UNTIL=not-a-real-date")
+        assert kb.scheduled_wake_time(conn, t) == (None, True)
+
+
+def test_list_scheduled_overdue_excludes_no_token_and_future_tokens(kanban_home):
+    with kbc.connect() as conn:
+        now = int(time.time())
+        overdue_task = kb.create_task(conn, title="overdue retry", assignee="ops")
+        kb.schedule_task(conn, overdue_task, reason="SCHEDULED_UNTIL=2026-01-01T00:00:00Z")
+        future_task = kb.create_task(conn, title="not due yet", assignee="ops")
+        kb.schedule_task(conn, future_task, reason="SCHEDULED_UNTIL=2099-01-01T00:00:00Z")
+        idea_park = kb.create_task(conn, title="idea, indefinite park", assignee="ops")
+        kb.schedule_task(conn, idea_park, reason="no wake time, deliberate")
+        malformed = kb.create_task(conn, title="malformed token", assignee="ops")
+        kb.schedule_task(conn, malformed, reason="SCHEDULED_UNTIL=garbage")
+        # Not scheduled at all -- must never appear regardless of status.
+        kb.create_task(conn, title="still just ready", assignee="ops")
+
+        out = kb.list_scheduled_overdue(conn, now=now)
+        by_id = {o["id"]: o for o in out}
+
+        assert overdue_task in by_id and by_id[overdue_task]["unparseable"] is False
+        assert malformed in by_id and by_id[malformed]["unparseable"] is True
+        assert future_task not in by_id
+        assert idea_park not in by_id
+
+        # Report-only: no status was touched.
+        assert kb.get_task(conn, overdue_task).status == "scheduled"
+        assert kb.get_task(conn, future_task).status == "scheduled"
+        assert kb.claim_task(conn, overdue_task) is None  # still not dispatchable
 
 
 

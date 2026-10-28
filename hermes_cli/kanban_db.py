@@ -3895,6 +3895,81 @@ def schedule_task(
         return True
 
 
+# ``SCHEDULED_UNTIL=<ISO8601>`` is a documented (``KANBAN_SCHEDULE_SCHEMA``)
+# but otherwise-unread convention: ``schedule_task`` deliberately does not
+# auto-dispatch on it (see its docstring), so without a read side, a worker
+# can write a wake time that nothing in this codebase ever looks at again.
+# ``scheduled_wake_time``/``list_scheduled_overdue`` are that read side --
+# intentionally reporting only, not promoting, so a stated wake time becomes
+# *visible* to whatever human or orchestrator calls ``unblock_task`` without
+# turning ``scheduled`` into a second, uncapped auto-retry status.
+#
+# The value is matched as ``\S+`` (any non-whitespace run), deliberately
+# broader than an ISO-8601 charset: a token with a typo or the wrong shape
+# must still be recognised as "a wake time was stated" so it is reported as
+# unparseable, not silently treated as "no wake time" (see
+# scheduled_wake_time's docstring on had_token).
+_SCHEDULED_UNTIL_RE = re.compile(r"SCHEDULED_UNTIL=(\S+)")
+
+
+def _parse_scheduled_until_token(raw: str) -> Optional[int]:
+    """Epoch seconds for a ``SCHEDULED_UNTIL`` token's ISO-8601 value.
+
+    Normalizes a trailing ``Z`` before delegating to ``_to_epoch``, the same
+    way ``auth.py``/``nous_account.py``/``status_auth.py`` do elsewhere in
+    this codebase -- ``datetime.fromisoformat`` only understands a bare 'Z'
+    natively on 3.11+, and this must also work on an older bundled
+    interpreter.
+    """
+    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    return _to_epoch(text)
+
+
+def scheduled_wake_time(conn: sqlite3.Connection, task_id: str) -> tuple[Optional[int], bool]:
+    """``(wake_epoch, had_token)`` for a ``scheduled`` task's most recent
+    ``scheduled`` event reason.
+
+    ``had_token`` is True whenever ``SCHEDULED_UNTIL=`` text is present, even
+    if its value failed to parse -- callers use this to tell "no wake time
+    stated" (a deliberate indefinite park, e.g. the ``ideas`` board's funnel
+    resting state) from "wake time stated but unparseable" (must be
+    surfaced, never silently dropped).
+    """
+    ev = _latest_event(conn, task_id, "scheduled")
+    reason = _json_dict(_row_get(ev, "payload")).get("reason") if ev else None
+    match = _SCHEDULED_UNTIL_RE.search(reason or "")
+    if not match:
+        return None, False
+    return _parse_scheduled_until_token(match.group(1)), True
+
+
+def list_scheduled_overdue(conn: sqlite3.Connection, *, now: Optional[int] = None) -> list[dict[str, Any]]:
+    """``scheduled`` tasks whose stated ``SCHEDULED_UNTIL`` has passed, plus
+    any whose token failed to parse (reported, not dropped, so a future
+    reason-text format change degrades loud rather than silent).
+
+    A ``scheduled`` task with no token at all is never included -- that is
+    the deliberate indefinite-park convention, not a stalled promise. This
+    performs no state change; it is the read-only surface for a status this
+    module intentionally never auto-dispatches (``kanban list --status
+    scheduled --overdue`` is its CLI entry point).
+    """
+    now = int(time.time()) if now is None else int(now)
+    out: list[dict[str, Any]] = []
+    for row in conn.execute("SELECT id, title FROM tasks WHERE status = 'scheduled'").fetchall():
+        task_id = row["id"]
+        wake_epoch, had_token = scheduled_wake_time(conn, task_id)
+        if not had_token:
+            continue
+        if wake_epoch is None:
+            out.append({"id": task_id, "title": row["title"], "scheduled_until": None, "unparseable": True})
+        elif wake_epoch <= now:
+            out.append({
+                "id": task_id, "title": row["title"], "scheduled_until": wake_epoch, "unparseable": False,
+            })
+    return out
+
+
 # --- Worker context builder (what a spawned worker sees) ---
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:

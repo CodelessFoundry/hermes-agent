@@ -205,7 +205,10 @@ KANBAN_SCHEDULE_SCHEMA = _schema(
         "Park your task as 'scheduled' while it waits for a time or external event. This ends the current run and makes the "
         "task non-dispatchable until an orchestrator unblocks it; it does not "
         "create a timer. Put any wake-up marker such as "
-        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason``."
+        "``SCHEDULED_UNTIL=<ISO8601>`` in ``reason`` -- whoever is responsible "
+        "for waking this card (you on a future pass, or an orchestrator) can "
+        "find every overdue one with ``kanban list --status scheduled "
+        "--overdue``; nothing promotes it automatically."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),

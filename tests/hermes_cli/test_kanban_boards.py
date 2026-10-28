@@ -373,6 +373,42 @@ class TestCLI:
         assert titlesB == ["Task B"]
         assert titlesD == []
 
+    def test_list_scheduled_overdue_cli_surface(self, tmp_path):
+        """``kanban list --status scheduled --overdue`` is the CLI entry point
+        for the SCHEDULED_UNTIL read side (list_scheduled_overdue) -- never
+        promotes, never touches a no-token (deliberate indefinite park) card."""
+        env = {"HERMES_HOME": str(tmp_path)}
+        r = _cli(["create", "overdue retry", "--assignee", "dev"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        overdue_id = json.loads(_cli(["list", "--json"], env_extra=env).stdout)[0]["id"]
+        r = _cli(["schedule", overdue_id, "SCHEDULED_UNTIL=2026-01-01T00:00:00Z", "retry"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+
+        r = _cli(["create", "idea, indefinite park", "--assignee", "dev"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        idea_id = [t["id"] for t in json.loads(_cli(["list", "--json"], env_extra=env).stdout)
+                   if t["title"] == "idea, indefinite park"][0]
+        r = _cli(["schedule", idea_id, "deliberate", "indefinite", "park"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+
+        # --overdue without --status scheduled is a usage error, not a filter.
+        bad = _cli(["list", "--overdue"], env_extra=env)
+        assert bad.returncode == 2
+
+        r = _cli(["list", "--status", "scheduled", "--overdue", "--json"], env_extra=env)
+        assert r.returncode == 0, r.stderr
+        out = json.loads(r.stdout)
+        ids = {o["id"] for o in out}
+        assert overdue_id in ids
+        assert idea_id not in ids  # deliberate indefinite park, never surfaced
+
+        # Report-only: the overdue card is still 'scheduled', not auto-promoted.
+        still_scheduled = [
+            t for t in json.loads(_cli(["list", "--status", "scheduled", "--json"], env_extra=env).stdout)
+            if t["id"] == overdue_id
+        ]
+        assert len(still_scheduled) == 1
+
 
 
 

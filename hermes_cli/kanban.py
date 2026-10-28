@@ -416,7 +416,27 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_list_overdue(args: argparse.Namespace) -> int:
+    """``kanban list --status scheduled --overdue``: report-only, never promotes."""
+    with kbc.connect_closing() as conn:
+        kb.recompute_ready(conn)
+        overdue = kb.list_scheduled_overdue(conn)
+    if _json_out(args, overdue):
+        return 0
+    if not overdue:
+        print("(no overdue scheduled tasks)")
+        return 0
+    for o in overdue:
+        when = "unparseable SCHEDULED_UNTIL" if o["unparseable"] else _fmt_ts(o["scheduled_until"])
+        print(f"⏱ {o['id']}  {when:19s}  {o['title']}")
+    return 0
+
+
 def _cmd_list(args: argparse.Namespace) -> int:
+    if getattr(args, "overdue", False):
+        if args.status != "scheduled":
+            return _err("kanban list: --overdue only applies with --status scheduled", 2)
+        return _cmd_list_overdue(args)
     assignee = args.assignee
     if args.mine and not assignee:
         assignee = _profile_author()
