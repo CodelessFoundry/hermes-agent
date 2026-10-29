@@ -97,6 +97,28 @@ def _hardline_rm_path(path_alt: str, tail: str = r'(?:\s|$|[)`;|&])') -> str:
 _HARDLINE_SYSTEM_DIRS = (r'/home|/home/\*|/root|/root/\*|/etc|/etc/\*|/usr|/usr/\*|'
                          r'/var|/var/\*|/bin|/bin/\*|/sbin|/sbin/\*|/boot|/boot/\*|/lib|/lib/\*')
 
+
+# `sudo` followed by its OWN option run, up to (but not consuming) the privilege flag the caller
+# appends. sudo stops parsing options at the first word that is not a `-`/`--` token, and that word
+# is the program it runs — so a flag AFTER it belongs to that program, not to sudo. Each skipped
+# token is either an option-with-argument in `--opt=value` / `-o value` / `--opt value` form, or a
+# standalone option; `--` ends sudo's options entirely (the following flags are the program's), so
+# the run never crosses it. Bounded to one command segment ([^;|&\n] inside the tokens) so an
+# unrelated later command isn't contaminated.
+# An option ARGUMENT may be quoted and contain spaces (`sudo -p 'enter pw: ' -S cmd`), so the value
+# alternatives accept a quoted string as ONE token — stopping at the space inside the quotes would
+# end the run early and drop the `-S` that follows.
+_SUDO_OPT_VALUE = r'(?:"[^"\n]*"|\'[^\'\n]*\'|[^\s;|&]+)'
+_SUDO_OWN_FLAG_RUN = (
+    r'\bsudo\b'
+    # option tokens sudo itself consumes: `-u root`, `--user=root`, `--prompt "x"`, `-n`
+    r'(?:\s+(?:-[a-rt-z]\s+' + _SUDO_OPT_VALUE + r'|--(?!\s)[a-z-]+=' + _SUDO_OPT_VALUE + r'?|'
+    r'--(?:close-from|group|host|prompt|user|chdir|role|type|command-timeout|other-user)\s+'
+    + _SUDO_OPT_VALUE + r'|'
+    r'-[a-rt-z]+|--(?!\s)(?!st|a)[a-z-]+))*'
+    r'\s+'
+)
+
 # `rm` plus flag group, shared by the rm hardline rules (plain concatenation, not f-string:
 # backslashes in replacement fields are unsupported on the 3.11 floor). _CMDPOS-anchored so `rm`
 # must be an actual command word — "rm -rf /" as DATA in `git commit -m "…rm -rf /…"` must not trip the floor.
@@ -462,12 +484,26 @@ DANGEROUS_PATTERNS = [
     # Sudo stdin/askpass/shell/list-privs flags. The agent has no TTY, so sudo invocations that succeed
     # non-interactively read the password from stdin (-S) or askpass (-A); -s (shell) and -a (list) are gated as
     # privilege chains (read SUDO_PASSWORD from .env -> sudo -S -s). Plain `sudo cmd` is TTY-bound and excluded. Input
-    # is lowercased, so S/s and A/a collapse. Lazy `[^;|&\n]*?` allows flag args without spanning separators. sudo
-    # resolves unambiguous long-flag prefixes: `--stdin` is the only long option starting with "st", `--askpass` the
-    # only one starting with "a".
-    (r'\bsudo\b[^;|&\n]*?\s+(?:-s\b|--st[a-z]*\b|-a\b|--a[a-z]*\b)', "sudo with privilege flag (stdin/askpass/shell/list)"),
-    # Combined short-flag form (-nS, -sa, -las).
-    (r'\bsudo\b[^;|&\n]*?\s+-[a-z]*[sa][a-z]*\b', "sudo with combined-flag privilege escalation"),
+    # is lowercased, so S/s and A/a collapse. sudo resolves unambiguous long-flag prefixes: `--stdin` is the only
+    # long option starting with "st", `--askpass` the only one starting with "a" (verified against sudo 1.9.15p5:
+    # `sudo --vers` prints the version, so the prefix classes must stay — `sudo --std cmd` really does read stdin).
+    #
+    # The flag run is bounded to SUDO'S OWN OPTIONS (`_SUDO_OWN_FLAG_RUN`), which stop at the first
+    # non-option word — the wrapped program's name. Previously a lazy `[^;|&\n]*?` scanned the WHOLE
+    # segment, so a flag belonging to the wrapped program was attributed to sudo:
+    # `sudo pvesm free x.tar --storage backup` matched `--st[a-z]*` (intended for `--stdin`), and
+    # `sudo ls -a /root` / `sudo grep -a pattern file` matched `-a` (intended for sudo's list-privs).
+    #
+    # The rule's own description promises "shell/list" coverage but the alternation only ever
+    # checked `-s` (shell, short form) and `-a`/`--a[a-z]*` (askpass, `-A`/`--askpass` lower-cased by
+    # the detector), never sudo's actual LIST option (`-l`/`--list`) or shell's LONG form (`--shell`).
+    # Verified against sudo 1.9.15p5 `sudo --help`: `-l, --list` and `-s, --shell` are real, distinct
+    # options from `-A, --askpass` and `-S, --stdin`. `--sh[a-z]*` is unambiguous for `--shell` (no
+    # other long option starts with "sh"); `-l`/`--li[a-z]*` is unambiguous for `--list` (no other
+    # option starts with "li" -- `--login` starts with "lo").
+    (_SUDO_OWN_FLAG_RUN + r'(?:-s\b|--st[a-z]*\b|--sh[a-z]*\b|-a\b|--a[a-z]*\b|-l\b|--li[a-z]*\b)', "sudo with privilege flag (stdin/askpass/shell/list)"),
+    # Combined short-flag form (-nS, -sa, -las, -ls).
+    (_SUDO_OWN_FLAG_RUN + r'-[a-z]*[sal][a-z]*\b', "sudo with combined-flag privilege escalation"),
     # Package-manager uninstall commands can remove installed software outside
     # the current project (notably `npm uninstall -g`). Treat their destructive
     # subcommands like other state-removing operations while leaving installs
@@ -489,6 +525,38 @@ _QUOTE_MASKED_DANGEROUS_DESCRIPTIONS = frozenset({
     "find dynamic shell word may expand to destructive flag",
     "dynamic shell word may expand to arbitrary program execution flag",
 })
+
+# Dangerous rules whose verb has no command-name token to anchor (the verb is a SUBCOMMAND —
+# `docker restart` — so `_CMDPOS` cannot reach it, and a bare `\bdocker\b` matches the word
+# wherever it appears, including inside a quoted operand). These are matched against a
+# QUOTE-MASKED variant instead: quoted text is data the shell passes as an argument, so a
+# MENTION (`echo "docker restart app"`, `git commit -m "...docker stop..."`) is not the action.
+_QUOTE_MASKED_DANGEROUS_DESCRIPTIONS = frozenset({
+    "docker restart/stop/kill (container lifecycle)",
+    "docker compose restart/stop/kill/down (container lifecycle)",
+})
+DANGEROUS_PATTERNS_COMPILED_MASKED = [
+    (pattern_re, description, description in _QUOTE_MASKED_DANGEROUS_DESCRIPTIONS)
+    for pattern_re, description in DANGEROUS_PATTERNS_COMPILED
+]
+# Commands whose QUOTED ARGUMENT is executed rather than printed: the quoted text is a command, so
+# quote-masked rules must scan such invocations RAW. `ssh host 'docker restart app'` really does
+# restart a container. Superset of _SHELL_CARRIER_NAMES (which covers local shells only) — remote
+# shells and container/VM exec wrappers carry a payload the same way.
+_DANGEROUS_QUOTED_PAYLOAD_CARRIERS = _SHELL_CARRIER_NAMES | {
+    "ssh", "docker", "podman", "kubectl", "lxc", "pct", "qm", "vagrant", "salt", "ansible",
+    "xargs", "timeout", "watch", "flock", "chroot", "su", "screen", "tmux",
+}
+
+
+def _contains_quoted_payload_carrier(command: str) -> bool:
+    """Whether any command-position word executes its quoted argument."""
+    return any(
+        os.path.basename(_deobfuscate_shell_word_for_detection(word)).lower()
+        in _DANGEROUS_QUOTED_PAYLOAD_CARRIERS
+        for _, _, word in _iter_shell_command_word_spans(command)
+    )
+
 
 # Preserve approvals stored under the removed interpreter regex rules.
 _REMOVED_PATTERN_KEY_ALIASES = {
