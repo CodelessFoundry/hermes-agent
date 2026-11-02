@@ -363,6 +363,17 @@ _BINARY_MAGICS = (
     b"!<arch>",              # static archive (.a)
     b"\x1f\x8b",             # gzip
     b"PK\x03\x04",           # zip (also .jar/.whl/.egg)
+    # SQLite3 database file (the on-disk format's own fixed 16-byte magic string). A cron
+    # job's prompt routinely tells the agent to run `sqlite3 <path>` against its own state
+    # database (e.g. an intel-pipeline job querying its own intel.db); a shell-tokenizer
+    # false split can misread the data file's bare path as the top-level "script" the line
+    # executes, and intel.db-sized databases sail past the 1 MiB referenced-script cap. A
+    # SQLite file is data, never a script this guard would shell/Python-execute, so it
+    # belongs with the other binary-format exemptions above rather than failing closed on
+    # size. The *live-connection* race guard (``offline_file_access`` in
+    # ``_read_referenced_script``) runs before this sniff and is unaffected: an open
+    # database is still refused without ever reaching this check. See #113944 follow-up.
+    b"SQLite format 3\x00",
 )
 
 
