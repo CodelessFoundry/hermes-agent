@@ -21,6 +21,43 @@ _INJECTION_PATTERNS: list = [  # shared by local-skill and plugin-skill paths
 _SUPPORT_DIRS = ("references", "templates", "assets", "scripts")
 _SKILL_FILE_EXTS = {".md", ".py", ".yaml", ".yml", ".json", ".tex", ".sh"}
 
+# Quote marks (straight + curly + backtick) recognised on either side of a matched phrase.
+_QUOTE_CHARS = frozenset('"\'\u201c\u201d\u2018\u2019`')
+# Punctuation allowed between the end of a matched phrase and its closing quote mark, e.g.
+# the trailing comma in `"ignore previous instructions,"` — a citation, not a live directive.
+_TRAILING_PUNCT = frozenset(',.;:!?)]} \t')
+
+
+def _is_quoted_citation(line: str, start: int, end: int) -> bool:
+    """True when ``line[start:end]`` (an _INJECTION_PATTERNS match) is bracketed by quote
+    marks on the same line — a cited example in documentation, not an injected directive.
+    Mirrors skills_guard.py's bare-mention-vs-imperative-intent split (bug #92021): local
+    context decides citation vs. live use, the pattern list itself stays untouched so a
+    genuinely unquoted directive still trips the warning."""
+    before = line[:start].rstrip()
+    if not before or before[-1] not in _QUOTE_CHARS:
+        return False
+    after = line[end:]
+    i = 0
+    while i < len(after) and after[i] in _TRAILING_PUNCT:
+        i += 1
+    return i < len(after) and after[i] in _QUOTE_CHARS
+
+
+def _content_has_injection_pattern(content: str) -> bool:
+    """True when *content* contains an ``_INJECTION_PATTERNS`` phrase as live text —
+    not as a quoted citation/example (e.g. a security- or disinfo-education skill
+    documenting the canonical phrase for its own readers to recognise). Checked per
+    line, since the quoting context that distinguishes the two never spans a newline."""
+    for line in content.lower().split("\n"):
+        for pattern in _INJECTION_PATTERNS:
+            start = 0
+            while (idx := line.find(pattern, start)) != -1:
+                if not _is_quoted_citation(line, idx, idx + len(pattern)):
+                    return True
+                start = idx + 1
+    return False
+
 
 def _json(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False)
@@ -141,7 +178,7 @@ def _serve_plugin_skill(
                      readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
     if file_path:
         return _serve_skill_file(skill_md.parent, file_path, qualified_name, read_error_prefix=True)
-    if any(p in content.lower() for p in _INJECTION_PATTERNS):
+    if _content_has_injection_pattern(content):
         logger.warning(
             "Plugin skill '%s:%s' contains patterns that may indicate prompt injection", namespace, bare)
     banner = ""
