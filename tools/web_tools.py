@@ -309,10 +309,19 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         limit = min(max(int(limit), 1), 100)
     except (TypeError, ValueError):
         limit = 5
+    # Strip before dispatch: a blank/whitespace-only query reaches the vendor API and burns a paid
+    # call only to be rejected remotely (e.g. Perplexity VALIDATION_ERROR "query Invalid input").
+    # Caught here once, every backend is protected — not just the one that happens to validate.
+    query = (query or "").strip()
     debug_call_data = {
         "parameters": {"query": query, "limit": limit}, "error": None, "results_count": 0,
         "original_response_size": 0, "final_response_size": 0,
     }
+    if not query:
+        error_text = "Empty search query. Pass a non-empty 'query' string describing what to search for."
+        debug_call_data["error"] = error_text
+        _finish_debug("web_search_tool", debug_call_data)
+        return json.dumps({"success": False, "error": error_text}, indent=2, ensure_ascii=False)
 
     try:
         from tools.interrupt import is_interrupted
