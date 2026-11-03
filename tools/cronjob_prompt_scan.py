@@ -39,6 +39,38 @@ _CRON_THREAT_PATTERNS = [
 # are vetted at install time — only unambiguous injection directives remain.
 _CRON_SKILL_ASSEMBLED_PATTERNS = _CRON_THREAT_PATTERNS[:4]
 
+# Quote marks (straight + curly + backtick) recognised on either side of a matched phrase —
+# mirrors tools/skills_tool_plugin.py's _is_quoted_citation (t_be9d36f3).
+_QUOTE_CHARS = frozenset('"\'\u201c\u201d\u2018\u2019`')
+# Punctuation allowed between the end of a matched phrase and its closing quote mark, e.g.
+# the trailing comma in `"ignore previous instructions,"` — a citation, not a live directive.
+_TRAILING_PUNCT = frozenset(',.;:!?)]} \t')
+
+# Pattern IDs where a quoted citation (both sides quote-bracketed on the same line) is exempt
+# from the block: these are canonical injection-PHRASE directives, the exact false-positive
+# class t_be9d36f3 already fixed for the skill security scanner — a postmortem, a false-positive
+# writeup, or (recursively, t_6aa22272) this very fix's own kanban history quoting the phrase as
+# a documented example can never execute as a live directive. Command-shape / exfiltration
+# patterns (_CRON_EXFIL_COMMAND_PATTERNS, and read_secrets/ssh_backdoor/sudoers_mod/
+# destructive_root_rm below) stay unconditional — a quoted curl/cat/rm command is the same bytes
+# if it were ever executed, so quoting buys nothing there. Never widen this set to loosen real
+# detection (same principle prepper-disinfo-defence documents).
+_QUOTE_AWARE_IDS = frozenset({"prompt_injection", "deception_hide", "sys_prompt_override", "disregard_rules"})
+
+
+def _is_quoted_citation(line: str, start: int, end: int) -> bool:
+    """True when ``line[start:end]`` (a threat-pattern match) is bracketed by quote marks on
+    the same line — a documented example/citation, not an injected directive."""
+    before = line[:start].rstrip()
+    if not before or before[-1] not in _QUOTE_CHARS:
+        return False
+    after = line[end:]
+    i = 0
+    while i < len(after) and after[i] in _TRAILING_PUNCT:
+        i += 1
+    return i < len(after) and after[i] in _QUOTE_CHARS
+
+
 _CRON_SECRET_VAR_RE = r'\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?'
 # Obvious leak paths only: secret in the destination URL, in a POST/form body, or in an
 # Authorization header to an arbitrary host.
@@ -110,7 +142,15 @@ def _strip_invisible_unicode(prompt: str) -> tuple[str, list[str]]:
 def _first_pattern_error(text: str, *pattern_sets) -> str:
     for patterns in pattern_sets:
         for pattern, pid in patterns:
-            if re.search(pattern, text, re.IGNORECASE):
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                if pid in _QUOTE_AWARE_IDS:
+                    line_start = text.rfind('\n', 0, match.start()) + 1
+                    line_end = text.find('\n', match.end())
+                    if line_end == -1:
+                        line_end = len(text)
+                    line = text[line_start:line_end]
+                    if _is_quoted_citation(line, match.start() - line_start, match.end() - line_start):
+                        continue  # cited example, not a live directive — keep scanning
                 return (
                     f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not "
                     "contain injection or exfiltration payloads."
