@@ -150,6 +150,11 @@ class WSTransport:
         #: The served profile home whose skin this peer follows (None = the launch home); see change_watcher.
         self.skin_home: str | None = None
         self._closed = False
+        #: True once ``_closed`` latched specifically because the peer was already gone (benign
+        #: disconnect race — see ``_is_benign_disconnect_send_error``). Callers that need to log a
+        #: failed send (e.g. the ready-frame check in ``handle_ws``) consult this so a routine lost
+        #: race doesn't get escalated past what ``_safe_send_many`` itself already logged for it.
+        self._closed_benign = False
         # Token-coalescing buffer. The lock guards the buffer + "armed" flag against worker threads
         # calling write(); the timer handle is only ever touched on the loop thread.
         self._token_lock = threading.Lock()
@@ -227,6 +232,12 @@ class WSTransport:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def closed_benign(self) -> bool:
+        """True if the socket latched closed because the peer was already gone (benign disconnect
+        race), as opposed to a real transport fault. Only meaningful once ``closed`` is True."""
+        return self._closed_benign
+
     async def write_async(self, obj: dict) -> bool:
         """Send from the owning loop; awaits until the frame is on the wire. Buffered tokens are flushed
         ahead of it in the SAME batch so nothing slips between."""
@@ -284,7 +295,8 @@ class WSTransport:
                 except Exception as exc:
                     # Latch while holding the writer lock so queued batches observe the failure first.
                     self._closed = True
-                    if _is_benign_disconnect_send_error(exc):
+                    self._closed_benign = _is_benign_disconnect_send_error(exc)
+                    if self._closed_benign:
                         # Routine: the client already left (handle_ws's own receive-side teardown
                         # handles session detach/reap independently of this send failing). Keep the
                         # signal at DEBUG instead of paging WARNING-level monitors for every reload/
@@ -572,7 +584,19 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
             send_failures += 1
-            _log.error("ws ready frame send failed peer=%s", peer)
+            if transport.closed_benign:
+                # Same benign disconnect race as _safe_send_many's generic case (t_ee5439b9), just
+                # hitting the very first send instead of a later one: the peer vanished between
+                # accept() and this write (reconnect-storm double-connect, tab closed instantly,
+                # etc). _safe_send_many already logged the DEBUG detail; don't re-escalate it to
+                # ERROR here, or every routine lost race pages ERROR-level monitors (t_3366ecde).
+                _log.debug("ws ready frame send skipped (peer already disconnected) peer=%s", peer)
+            else:
+                # Not a benign race: the client's socket was genuinely live but the ready handshake
+                # still failed to go out, so it never learned the gateway is ready. Unlike the
+                # benign case, this IS user-visible (the client hangs with no gateway.ready) and
+                # stays at ERROR so it keeps paging.
+                _log.error("ws ready frame send failed peer=%s", peer)
             return
 
         dispatcher = asyncio.create_task(_dispatch_loop())
