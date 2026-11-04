@@ -263,19 +263,34 @@ def _quiet_noisy_loggers() -> None:
 # reconnects normally. Matched upstream projects hitting the exact same noise (Prefect
 # #22090, Baserow #5224) fixed it the same way: suppress only this one benign shape at the
 # logging layer, so every OTHER unhandled asyncio error still surfaces at ERROR (#<task t_ee74b8ee>).
-_BENIGN_WS_KEEPALIVE_TIMEOUT_MESSAGE = "ConnectionClosedError exception in shielded future"
-_BENIGN_WS_KEEPALIVE_TIMEOUT_REASON = "keepalive ping timeout"
+#
+# ConnectionClosedOK/1005 ("no status received") is the TWIN of the same teardown, not a
+# different bug: it fires from a sibling shielded await in the same legacy protocol instance
+# (e.g. the keepalive ping/pong waiter or connection_lost_waiter) when the peer's socket drops
+# without completing a close handshake, instead of (or alongside) a ping timing out. Confirmed
+# back-to-back on the SAME disconnecting peer in errors.log.1 (2026-10-23 11:16:47 OK/1005,
+# then 11:17:27 Error/'keepalive ping timeout' — one real event, two shielded-future log lines).
+# Hit every multiplexed profile at once on 2026-11-04 (t_98d2ea45) because each profile's own
+# SSH-isolated web_server backend independently hit its idle-exit timer ("no client and no
+# running turn; exiting") within the same ~10s window and tore its own WS server down without a
+# clean close frame — six independent, individually-benign teardowns of already-idle servers
+# with nothing in flight to lose, not one correlated failure.
+_BENIGN_SHIELDED_FUTURE_SHAPES = (
+    ("ConnectionClosedError exception in shielded future", "keepalive ping timeout"),
+    ("ConnectionClosedOK exception in shielded future", "NO_STATUS_RCVD"),
+)
 
 
 class _BenignWSKeepaliveTimeoutFilter(logging.Filter):
-    """Demote the legacy-websockets keepalive-ping-timeout shielded-future log to DEBUG.
+    """Demote known-benign legacy-websockets shielded-future teardown logs to DEBUG.
 
-    Matches only the exact benign shape (message prefix AND the keepalive-ping-timeout close
-    reason in the formatted text); every other "asyncio" logger record — including a
-    ConnectionClosedError for a different reason — passes through unchanged at its original
-    level. DEBUG (not dropped) keeps it visible to --verbose/setup_verbose_logging() for anyone
-    actively chasing websocket behavior; INFO-level agent.log and WARNING-level errors.log
-    (the files an operator actually reads day to day) stop seeing it as noise.
+    Matches only the exact benign shapes in ``_BENIGN_SHIELDED_FUTURE_SHAPES`` (message prefix
+    AND its paired close-reason/code marker in the formatted text); every other "asyncio"
+    logger record — including either exception class for a different reason/code — passes
+    through unchanged at its original level. DEBUG (not dropped) keeps it visible to
+    --verbose/setup_verbose_logging() for anyone actively chasing websocket behavior;
+    INFO-level agent.log and WARNING-level errors.log (the files an operator actually reads day
+    to day) stop seeing it as noise.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -285,13 +300,12 @@ class _BenignWSKeepaliveTimeoutFilter(logging.Filter):
             text = record.getMessage()
         except Exception:
             return True
-        if not text.startswith(_BENIGN_WS_KEEPALIVE_TIMEOUT_MESSAGE):
-            return True
-        if _BENIGN_WS_KEEPALIVE_TIMEOUT_REASON not in text:
-            return True  # a different close reason is a real surprise; keep it loud
-        record.levelno = logging.DEBUG
-        record.levelname = "DEBUG"
-        return True
+        for message_prefix, reason_marker in _BENIGN_SHIELDED_FUTURE_SHAPES:
+            if text.startswith(message_prefix) and reason_marker in text:
+                record.levelno = logging.DEBUG
+                record.levelname = "DEBUG"
+                return True
+        return True  # no known-benign shape matched; keep it loud — could be a real surprise
 
 
 def _install_benign_ws_keepalive_timeout_filter() -> None:

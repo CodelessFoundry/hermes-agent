@@ -1179,3 +1179,65 @@ def test_router_never_builds_a_child_handler_under_a_lock_logging_shutdown_takes
     assert shutdown_got_router_lock == [True], (
         "lock-order inversion: logging.shutdown (under logging._lock) could not take the router's "
         "lock while the router built a child handler (which needs logging._lock)")
+
+
+class TestBenignWSShieldedFutureFilter:
+    """t_98d2ea45: ConnectionClosedOK/1005 is the benign twin of the already-demoted
+    ConnectionClosedError/'keepalive ping timeout' shielded-future log (both come from
+    asyncio.shield()'s own `_log_on_exception` safety net in the legacy websockets protocol
+    tearing down a connection nothing is still awaiting)."""
+
+    def _make_record(self, message: str) -> logging.LogRecord:
+        return logging.LogRecord("asyncio", logging.ERROR, __file__, 1, message, None, None)
+
+    def test_demotes_connection_closed_ok_no_status_received(self):
+        record = self._make_record(
+            "ConnectionClosedOK exception in shielded future\n"
+            "future: <Future finished exception=ConnectionClosedOK(Close(code="
+            "<CloseCode.NO_STATUS_RCVD: 1005>, reason=''), Close(code="
+            "<CloseCode.NO_STATUS_RCVD: 1005>, reason=''), True)>")
+        assert hermes_logging._BenignWSKeepaliveTimeoutFilter().filter(record) is True
+        assert record.levelno == logging.DEBUG
+        assert record.levelname == "DEBUG"
+
+    def test_still_demotes_connection_closed_error_keepalive_timeout(self):
+        record = self._make_record(
+            "ConnectionClosedError exception in shielded future\n"
+            "future: <Future finished exception=ConnectionClosedError(None, Close(code="
+            "<CloseCode.INTERNAL_ERROR: 1011>, reason='keepalive ping timeout'), None)>")
+        assert hermes_logging._BenignWSKeepaliveTimeoutFilter().filter(record) is True
+        assert record.levelno == logging.DEBUG
+
+    def test_does_not_demote_connection_closed_ok_for_a_different_close_code(self):
+        """A different close code on the same exception class is a real surprise, not the
+        verified-benign idle-teardown shape — must stay loud."""
+        record = self._make_record(
+            "ConnectionClosedOK exception in shielded future\n"
+            "future: <Future finished exception=ConnectionClosedOK(Close(code="
+            "<CloseCode.NORMAL_CLOSURE: 1000>, reason='bye'), None, True)>")
+        assert hermes_logging._BenignWSKeepaliveTimeoutFilter().filter(record) is True
+        assert record.levelno == logging.ERROR
+
+    def test_does_not_demote_unrelated_asyncio_error(self):
+        record = self._make_record("Unclosed client session")
+        assert hermes_logging._BenignWSKeepaliveTimeoutFilter().filter(record) is True
+        assert record.levelno == logging.ERROR
+
+    def test_install_is_idempotent_and_wired_into_quiet_noisy_loggers(self):
+        asyncio_logger = logging.getLogger("asyncio")
+        before = [f for f in asyncio_logger.filters
+                   if isinstance(f, hermes_logging._BenignWSKeepaliveTimeoutFilter)]
+        for f in before:
+            asyncio_logger.removeFilter(f)
+        try:
+            hermes_logging._quiet_noisy_loggers()
+            hermes_logging._quiet_noisy_loggers()  # second call must not stack a duplicate
+            installed = [f for f in asyncio_logger.filters
+                         if isinstance(f, hermes_logging._BenignWSKeepaliveTimeoutFilter)]
+            assert len(installed) == 1
+        finally:
+            for f in list(asyncio_logger.filters):
+                if isinstance(f, hermes_logging._BenignWSKeepaliveTimeoutFilter):
+                    asyncio_logger.removeFilter(f)
+            for f in before:
+                asyncio_logger.addFilter(f)
