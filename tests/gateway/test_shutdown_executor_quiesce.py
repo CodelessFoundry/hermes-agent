@@ -434,3 +434,55 @@ async def test_default_executor_worker_is_seen_by_the_close_guard():
         f"SessionDB was closed/checkpointed while the detached hygiene worker was still alive: {events}"
     )
     assert gw._active_deferred_agent_worker_count() == 0, "finished worker left registered"
+
+
+@pytest.mark.asyncio
+async def test_kanban_tick_worker_is_seen_by_the_close_guard():
+    """The kanban watcher tick's auto_decompose_tick/tick_once/ready_nonempty calls run on the
+    loop's DEFAULT executor via ``asyncio.to_thread`` -- the same blind spot
+    ``test_default_executor_worker_is_seen_by_the_close_guard`` closes for the hygiene
+    compressor, but with no turn/handler-side counter of its own to catch it. Before
+    ``_tracked_to_thread_process_service`` (#94736; live Nov 7 occurrence root-caused in
+    t_6b3334b8: a decompose tick survived a SIGUSR1-driven close with a mid-flight
+    '[Errno 9] Bad file descriptor' when final-cleanup reaped the shared aux HTTP client out
+    from under it, then reopened state.db on its retry), the watcher loop's own asyncio Task
+    being cancelled on shutdown did nothing to stop the blocking call already handed to the
+    executor pool -- drain saw 0 everywhere and state.db closed while the tick's write was
+    still in flight. Driving ``_tracked_to_thread_process_service`` directly (not through the
+    full watcher loop, which needs a live kanban dispatcher) proves the registration half of
+    the fix: the call must be visible to the close guard for its whole duration.
+    """
+    from types import MethodType
+
+    from gateway import kanban_watchers_common as kwc
+
+    events = []
+    gw = _FakeGateway(events)
+    gw._track_deferred_agent_worker = MethodType(  # type: ignore[method-assign]
+        gw_mod.GatewayRunner._track_deferred_agent_worker, gw
+    )
+
+    release = threading.Event()
+    started = threading.Event()
+
+    def _slow_tick():
+        started.set()
+        release.wait(5.0)
+        events.append("tick_write")
+
+    original_timeout = gw_mod._EXECUTOR_QUIESCE_TIMEOUT
+    gw_mod._EXECUTOR_QUIESCE_TIMEOUT = 0.0
+    call = asyncio.ensure_future(kwc._tracked_to_thread_process_service(gw, _slow_tick))
+    try:
+        assert await asyncio.to_thread(started.wait, 2.0), "tick worker never started"
+        await gw_mod.GatewayRunner.stop(gw)
+    finally:
+        gw_mod._EXECUTOR_QUIESCE_TIMEOUT = original_timeout
+        release.set()
+        await asyncio.wait_for(call, 5.0)
+
+    assert "tick_write" in events, "tick worker never finished"
+    assert "close:session_db" not in events, (
+        f"SessionDB was closed/checkpointed while the kanban tick worker was still alive: {events}"
+    )
+    assert gw._active_deferred_agent_worker_count() == 0, "finished worker left registered"

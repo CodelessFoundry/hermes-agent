@@ -34,6 +34,38 @@ async def _to_thread_process_service(func: Callable[..., Any], /, *args: Any) ->
     return await asyncio.to_thread(_run_in_fresh_context, func, *args)
 
 
+async def _tracked_to_thread_process_service(gateway: Any, func: Callable[..., Any], /, *args: Any) -> Any:
+    """Like :func:`_to_thread_process_service`, but visible to shutdown's drain for the
+    call's whole duration (same registration ``run_turn_hygiene`` uses for detached
+    compaction workers — see its ``_track_deferred_agent_worker`` call).
+
+    The kanban watcher loop (notifier/dispatcher) runs on the gateway's event loop, so its
+    OWN asyncio Task is in ``_background_tasks`` and gets cancelled on shutdown — but
+    cancelling that Task does not stop a blocking call already handed to the loop's default
+    executor (``asyncio.to_thread``'s pool, not ``self._executor``). ``auto_decompose_tick``
+    is the sharp edge: it makes a real outbound auxiliary-LLM call (tens of seconds) to
+    decompose a triage card, on the SAME default executor ``_active_cron_job_count`` /
+    ``_active_api_run_count`` / ``_active_deferred_agent_worker_count`` were each added to
+    cover for their own categories (cron ticks, API-server runs, detached hygiene workers) —
+    none of the three counts this fourth category. A SIGUSR1 restart arriving mid-tick saw
+    drain report 0 everywhere, closed state.db, and the tick's eventual completion/retry
+    landed its write against the closed handle (teardown/worker race, #94736; root-caused in
+    t_6b3334b8 against a live Nov 7 occurrence: a decompose started at 03:02:34, survived the
+    03:02:58 close with a mid-flight '[Errno 9] Bad file descriptor' when final-cleanup
+    reaped the shared aux HTTP client out from under it, and the warning landed at 03:03:31
+    once the immediate retry finished). Wrapping the call site's future as a deferred agent
+    worker (``agent=None``: this is raw thread work, not an interruptible agent turn — the
+    same no-op-safe shape ``_interrupt_deferred_agent_workers`` already special-cases) makes
+    the shutdown gate wait for it like it already waits for cron/API/hygiene work, instead of
+    skipping straight to close.
+    """
+    future = asyncio.ensure_future(_to_thread_process_service(func, *args))
+    track = getattr(gateway, "_track_deferred_agent_worker", None)
+    if callable(track):
+        track(future, None)
+    return await future
+
+
 def _list_boards(kb: Any) -> list:
     """Enumerate live boards; fall back to the default board when listing fails."""
     try:
