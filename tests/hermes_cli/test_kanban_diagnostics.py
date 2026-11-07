@@ -111,6 +111,162 @@ def test_stuck_in_blocked_fires_past_threshold():
     assert d.data["age_hours"] >= 48
 
 
+# ---------------------------------------------------------------------------
+# blocked_stale_despite_comments — complement to _rule_stuck_in_blocked
+#
+# _rule_stuck_in_blocked is fully silenced by ANY comment after the block,
+# which hides a long-blocked card that gets periodic "I re-checked, nothing
+# changed" audit comments instead of an actual resolution. Reconstructed
+# shaped exactly like the real live case, harness:t_1c68c712: blocked
+# 2026-10-11, re-audited (comments) ~3 days and ~10 days later, 17+ days
+# stale and never once flagged.
+# ---------------------------------------------------------------------------
+
+
+def test_blocked_stale_despite_comments_fires_on_audit_shaped_history():
+    """Reconstructed t_1c68c712 shape: blocked, then two comments each a real
+    audit re-check days apart, status never changes. The existing
+    stuck_in_blocked rule would stay silent forever here (a comment exists
+    after the block) — this rule must fire instead."""
+    now = int(time.time())
+    blocked_ts = now - 20 * 86400
+    task = _task(status="blocked")
+    events = [
+        _event("blocked", ts=blocked_ts, reason="needs_input"),
+        _event("commented", ts=blocked_ts + 3 * 86400),   # re-audit #1
+        _event("commented", ts=blocked_ts + 10 * 86400),  # re-audit #2
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    stale = [d for d in diags if d.kind == "blocked_stale_despite_comments"]
+    assert len(stale) == 1
+    d = stale[0]
+    assert d.data["comment_count"] == 2
+    assert d.data["age_days"] >= 20
+    # _rule_stuck_in_blocked must stay silent (a comment exists after the
+    # block) — this rule is additive, not a replacement.
+    assert "stuck_in_blocked" not in [x.kind for x in diags]
+
+
+def test_blocked_stale_despite_comments_not_fired_by_tight_exchange():
+    """A real back-and-forth (comments close together) looks like it may
+    have resolved something — must NOT fire, even past the age threshold."""
+    now = int(time.time())
+    blocked_ts = now - 20 * 86400
+    task = _task(status="blocked")
+    events = [
+        _event("blocked", ts=blocked_ts),
+        _event("commented", ts=blocked_ts + 3600),   # 1h later
+        _event("commented", ts=blocked_ts + 7200),   # 2h later — tight pair
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert "blocked_stale_despite_comments" not in [d.kind for d in diags]
+
+
+def test_blocked_stale_despite_comments_requires_age_threshold():
+    """Same audit shape, but the block is only 3 days old — too young to
+    fire regardless of comment spacing."""
+    now = int(time.time())
+    blocked_ts = now - 3 * 86400
+    task = _task(status="blocked")
+    events = [
+        _event("blocked", ts=blocked_ts),
+        _event("commented", ts=blocked_ts + 86400),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert "blocked_stale_despite_comments" not in [d.kind for d in diags]
+
+
+def test_blocked_stale_despite_comments_single_comment_still_fires():
+    """A single early comment followed by long silence is vacuously 'every
+    comment spaced apart' (zero pairs to compare) — it should fire, not be
+    treated as a special case."""
+    now = int(time.time())
+    blocked_ts = now - 20 * 86400
+    task = _task(status="blocked")
+    events = [
+        _event("blocked", ts=blocked_ts),
+        _event("commented", ts=blocked_ts + 60),  # 1 minute after block
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert "blocked_stale_despite_comments" in [d.kind for d in diags]
+
+
+# ---------------------------------------------------------------------------
+# stale_untouched_todo — Scott's literal ask (t_c09b7e63 ask 2)
+#
+# Scoped narrowly: status=todo, no open parent link, zero
+# claimed/spawned/commented events ever, age >= 14 days. Must NOT fire on a
+# root card that's legitimately waiting on an in-flight child (the t_01697e00
+# shape) — that card has plenty of historical claimed/spawned events from the
+# day it was worked and decomposed, even though nothing has happened on it
+# since.
+# ---------------------------------------------------------------------------
+
+
+def test_stale_untouched_todo_fires_when_genuinely_untouched():
+    now = int(time.time())
+    created_at = now - 20 * 86400
+    task = _task(status="todo", created_at=created_at)
+    events = [_event("created", ts=created_at)]
+    graph = {"parents": [], "children": []}
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, graph=graph)
+    stale = [d for d in diags if d.kind == "stale_untouched_todo"]
+    assert len(stale) == 1
+    assert stale[0].data["age_days"] >= 20
+
+
+def test_stale_untouched_todo_does_not_fire_with_open_parent():
+    """A todo card gated by a real open parent link must not fire — the
+    dependency gate already explains the silence."""
+    now = int(time.time())
+    created_at = now - 20 * 86400
+    task = _task(status="todo", created_at=created_at)
+    events = [_event("created", ts=created_at)]
+    graph = {"parents": [{"id": "t_parent", "title": "p", "status": "todo"}], "children": []}
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, graph=graph)
+    assert "stale_untouched_todo" not in [d.kind for d in diags]
+
+
+def test_stale_untouched_todo_does_not_fire_on_worked_then_waiting_shape():
+    """Reconstructed t_01697e00 shape: a root card with NO parent of its own,
+    worked and decomposed the same day it was created, then 6+ weeks of
+    silence while its last open CHILD resolves. It has no open parent link
+    (it's a root card) but it DOES have historical claimed/spawned events —
+    the event-history check must exclude it, not the parent-link check."""
+    now = int(time.time())
+    created_at = now - 45 * 86400
+    task = _task(status="todo", created_at=created_at)
+    events = [
+        _event("created", ts=created_at),
+        _event("claimed", ts=created_at + 10),
+        _event("spawned", ts=created_at + 15),
+        _event("completed", ts=created_at + 3600),  # decomposed same day
+    ]
+    graph = {"parents": [], "children": [{"id": "t_1c68c712", "title": "c", "status": "blocked"}]}
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, graph=graph)
+    assert "stale_untouched_todo" not in [d.kind for d in diags]
+
+
+def test_stale_untouched_todo_requires_age_threshold():
+    now = int(time.time())
+    created_at = now - 5 * 86400
+    task = _task(status="todo", created_at=created_at)
+    events = [_event("created", ts=created_at)]
+    graph = {"parents": [], "children": []}
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, graph=graph)
+    assert "stale_untouched_todo" not in [d.kind for d in diags]
+
+
+def test_stale_untouched_todo_silent_without_graph_context():
+    """Graph-aware, same convention as _rule_running_with_open_parents: no
+    graph passed means the parent set is unknown, so stay silent rather than
+    risk a false positive."""
+    now = int(time.time())
+    created_at = now - 20 * 86400
+    task = _task(status="todo", created_at=created_at)
+    events = [_event("created", ts=created_at)]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert "stale_untouched_todo" not in [d.kind for d in diags]
 
 
 
