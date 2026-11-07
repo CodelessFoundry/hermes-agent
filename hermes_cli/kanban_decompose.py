@@ -337,7 +337,51 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column, EXCLUDING cards that
+    landed there via the unblock-loop breaker (``block_loop_detected``).
+
+    Added 2026-10-22 (t_48b8d912). ``_route_block`` in kanban_db.py routes a
+    card to ``triage`` at ``BLOCK_RECURRENCE_LIMIT`` purely to break an
+    infinite block->unblock->re-block cycle — its own docstring says this is
+    "for a human", not for the LLM decomposer. But this function previously
+    returned EVERY ``status='triage'`` row with no regard for why it got
+    there, so the auto-decompose tick swept up loop-broken cards exactly like
+    genuinely-underspecified ones.
+
+    Measured live on t_ab79a0c2 (a fully-specified, Scott-approved, 6-minute
+    reversible UDM-SE test): the card hit the loop breaker twice while
+    structurally blocked on an unrelated grant-matching bug, and both times
+    the auto-decomposer rewrote its title and body and added stop
+    conditions the ORIGINAL approved instructions never had — which is what
+    actually stalled the approved test, on top of the grant bug itself.
+    A card stuck on an approval/grant problem needs that problem fixed (or a
+    human decision), not an LLM's best guess at a different task.
+
+    The most recent ``task_events`` row is the signal: right after
+    ``_route_block`` writes ``block_loop_detected`` the card sits in triage
+    with that as its newest event, until something else (a decompose, a
+    comment, a manual promote) moves it on. A genuinely fresh triage card's
+    newest event is ``created``/``commented``/etc. — untouched by this.
+
+    This only narrows the AUTOMATIC tick's candidate pool. A human can still
+    force it via ``hermes kanban decompose <id>`` (calls ``decompose_task``
+    directly, bypassing this list) if a loop-broken card genuinely does need
+    re-specification.
+    """
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        ids = []
+        for row in rows:
+            event = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? "
+                "ORDER BY id DESC LIMIT 1", (row.id,),
+            ).fetchone()
+            if event and event["kind"] == "block_loop_detected":
+                logger.debug(
+                    "kanban auto-decompose: skipping %s, triage via "
+                    "block_loop_detected (needs a human, not a rewrite)",
+                    row.id,
+                )
+                continue
+            ids.append(row.id)
+    return ids
