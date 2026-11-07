@@ -17,8 +17,13 @@ up with ``assignee=None``.
 
 from __future__ import annotations
 
+import importlib
+import json
 import logging
+import os
 import re
+import sys
+import types
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,6 +37,115 @@ from hermes_cli.kanban_specify import (
 from hermes_cli.kanban_specify import _profile_author as _specify_author
 
 logger = logging.getLogger(__name__)
+
+
+# --- live-grant skip (t_322addbd) ------------------------------------------
+# Scott's "at minimum" ask out of t_07532d30 round 2: don't fan a triage card
+# out into children when it is already holding a live, unspent board grant.
+# A grant lives on the ORIGINAL task_id's event history
+# (board_grants.find_board_grant reads task_events WHERE task_id=<that id>);
+# decomposing moves the actual work onto fresh child task_ids that have no
+# history of their own, so the grant becomes invisible and the child just
+# re-asks Scott for something he already approved. Skipping decomposition
+# entirely is lower-risk than trying to carry the grant forward (see
+# grant_inheritance.py in ~/.hermes/infra/policy for that alternative, which
+# this card deliberately does NOT touch or depend on).
+#
+# ~/.hermes/infra/policy is an OPTIONAL install, not a hermes-agent
+# dependency, so this is a soft integration: if board_grants isn't
+# importable, the check below always returns "no skip" and decomposition
+# proceeds exactly as it did before this existed. It can only ever cause a
+# card to decompose a little later than it otherwise would (once the grant
+# that would have been wasted has expired or been spent) — never cause a
+# card to decompose that previously wouldn't have, and never touch who may
+# approve anything.
+_POLICY_DIR = os.path.expanduser("~/.hermes/infra/policy")
+
+
+def _board_grants_module():
+    """Best-effort import of the optional infra-policy ``board_grants``
+    helper. Returns ``None`` (never raises) when it isn't installed."""
+    if _POLICY_DIR not in sys.path:
+        sys.path.insert(0, _POLICY_DIR)
+    try:
+        return importlib.import_module("board_grants")
+    except Exception:
+        logger.debug(
+            "decompose: board_grants not importable (%s) — skipping the "
+            "live-grant pre-decomposition check", _POLICY_DIR, exc_info=True,
+        )
+        return None
+
+
+def _last_block_reason(task_id: str) -> Optional[str]:
+    """The ``reason`` text of ``task_id``'s most recent ``blocked`` /
+    ``block_loop_detected`` event, or ``None`` if it was never blocked.
+    Read through the SAME board connection ``decompose_task`` itself uses
+    (``kbc.connect_closing()``), so this always looks at the board the
+    decomposer is about to act on rather than re-deriving board context
+    separately."""
+    with kbc.connect_closing() as conn:
+        row = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind IN ('blocked', 'block_loop_detected') "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        return (json.loads(row[0]) or {}).get("reason") or ""
+    except Exception:
+        return ""
+
+
+def _live_grant_skip_reason(task_id: str) -> Optional[str]:
+    """Non-``None`` (a human-readable reason) when ``task_id``'s last block
+    reason carries an ``APPROVAL-REQUEST`` token Scott has already answered
+    with a live, unspent board grant — meaning decomposition should be
+    skipped. Fails open (returns ``None``, i.e. "don't skip") on anything
+    that stops it from answering with confidence: no ``board_grants``
+    module, no block history, no parseable token, or an error reading the
+    board — in every one of those cases decomposition proceeds exactly as
+    it always has, nothing new is prevented.
+    """
+    bg = _board_grants_module()
+    if bg is None:
+        return None
+    reason = _last_block_reason(task_id)
+    if not reason:
+        return None
+    try:
+        # Reuse board_grants' own token parser rather than re-implementing it
+        # (same reuse pattern grant_inheritance.py uses for this module).
+        tokens = bg._parse_tokens(reason)
+    except Exception:
+        logger.warning("decompose: failed to parse block tokens for %s", task_id, exc_info=True)
+        return None
+    for verb, kind, ident in tokens:
+        action = types.SimpleNamespace(verb=verb, kind=kind, id=ident, target_host=None)
+        try:
+            # audit=False: this is a HYPOTHETICAL pre-decomposition question
+            # ("would a grant be minted"), not a real evaluate()/consume()
+            # decision -- same contract board_grants.find_board_grant
+            # documents for the approval clock's own pre-checks.
+            grant = bg.find_board_grant(action, task_id=task_id, run_id=None, audit=False)
+        except Exception:
+            logger.warning(
+                "decompose: find_board_grant raised while checking %s for a "
+                "live grant on %s/%s:%s — not skipping", task_id, verb, kind, ident,
+                exc_info=True,
+            )
+            continue
+        if grant is not None:
+            scope = f"{verb}/{kind}" + (f":{ident}" if ident else "")
+            return (
+                f"task holds a live, unspent board grant for {scope} (from its "
+                "last block reason) — skipping decomposition so the already-"
+                "approved request isn't fanned out into children that would "
+                "have to ask again"
+            )
+    return None
 
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
@@ -312,6 +426,15 @@ def decompose_task(
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
+
+    # t_322addbd: don't fan a card out while it's still holding an approval
+    # Scott already gave it. Checked BEFORE the aux LLM call (not just before
+    # decompose_triage_task) so a card stuck here on repeated auto-decompose
+    # ticks doesn't burn an LLM call every time for nothing.
+    skip_reason = _live_grant_skip_reason(task_id)
+    if skip_reason:
+        logger.info("decompose: skipping %s — %s", task_id, skip_reason)
+        return DecomposeOutcome(task_id, False, skip_reason)
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
