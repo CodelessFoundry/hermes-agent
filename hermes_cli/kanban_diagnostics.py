@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
+import itertools
 import json
 import time
 
@@ -620,6 +621,86 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_blocked_stale_despite_comments(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Blocked >= cfg["blocked_audit_stale_days"] (default 7) where every
+    comment since the block is spaced >= cfg["blocked_audit_min_gap_hours"]
+    (default 24h) apart from its neighbour — the shape of periodic audit
+    re-checks confirming the block condition, not a live back-and-forth that
+    answered it. Complements ``_rule_stuck_in_blocked``: that rule is fully
+    silenced by ANY comment after the block (line ~607), which is correct
+    when a comment means "here is your answer" and wrong when it means "I
+    re-checked and nothing has changed." This rule does not try to classify
+    what a comment MEANS — it only refuses to let comment count alone reset
+    an arbitrarily long clock, the same way ``_rule_block_unblock_cycling``
+    already complements it for the fast block/unblock-cycling case.
+
+    Proven live on ``harness:t_1c68c712``: blocked 2026-10-11, re-audited
+    2026-10-14 and 2026-10-21 (both times confirming the wait condition had
+    already resolved, both times posting a comment rather than forcing
+    resolution because a worker cannot self-unblock). Each comment reset
+    ``_rule_stuck_in_blocked``'s clock, so a 17+ day stale, fully-actionable
+    blocked card never once surfaced despite three human-grade audits.
+    ``_rule_block_unblock_cycling`` doesn't catch this either — it needs
+    actual unblock events, and none occurred here.
+
+    The "every comment >=min_gap apart" check is pairwise between comments
+    only (NOT block-to-first-comment or last-comment-to-now), so a single
+    early comment followed by long silence still fires (vacuously "every
+    comment is spaced apart" with zero pairs to compare) — that is in fact
+    exactly the shape that should fire, not an edge case to special-case
+    around.
+    """
+    if _task_field(task, "status") != "blocked":
+        return []
+    days_threshold = float(cfg.get("blocked_audit_stale_days", 7))
+    min_gap_hours = float(cfg.get("blocked_audit_min_gap_hours", 24))
+    last_blocked_ts = _latest_event_ts(events, {"blocked"})
+    if last_blocked_ts == 0:
+        return []
+    age_days = (now - last_blocked_ts) / 86400.0
+    if age_days < days_threshold:
+        return []
+    comment_tss = sorted(
+        _event_ts(ev) for ev in events
+        if _event_kind(ev) == "commented" and _event_ts(ev) > last_blocked_ts
+    )
+    if not comment_tss:
+        # No comments at all since the block: _rule_stuck_in_blocked already
+        # covers this (nothing resets its much shorter clock) — don't double-fire.
+        return []
+    if any((b - a) / 3600.0 < min_gap_hours for a, b in itertools.pairwise(comment_tss)):
+        # A tight exchange between comments looks like a live back-and-forth
+        # that may have resolved something — leave it to a human to judge.
+        return []
+
+    task_id = str(_task_field(task, "id") or "")
+    age_str = f"{age_days:.1f}d"
+    # Escalate with age the same way _rule_stale_running/_rule_stranded_in_ready do.
+    if age_days >= days_threshold * 3:
+        severity = "critical"
+    elif age_days >= days_threshold * 1.5:
+        severity = "error"
+    else:
+        severity = "warning"
+    return [Diagnostic(
+        kind="blocked_stale_despite_comments", severity=severity,
+        title=f"Blocked {age_str}, {len(comment_tss)} comment(s) never resolved it",
+        detail=(
+            f"This task has been blocked for {age_str} and has had {len(comment_tss)} comment(s) "
+            f"since, none within {int(min_gap_hours)}h of another — the shape of periodic re-checks "
+            f"confirming the block condition, not a back-and-forth that answered it. "
+            f"`_rule_stuck_in_blocked`'s clock resets on any comment, so repeated audits like this "
+            f"can hide an arbitrarily long stale block. If the comments confirm the wait is over, "
+            f"unblock the task — a worker cannot do this for itself."
+        ),
+        actions=[DiagnosticAction(kind="unblock", label="Unblock the task", suggested=True),
+                 _cli_hint(f"Review comments: hermes kanban show {task_id}", f"hermes kanban show {task_id}")],
+        first_seen_at=last_blocked_ts, last_seen_at=comment_tss[-1], count=len(comment_tss),
+        data={"blocked_at": last_blocked_ts, "age_days": round(age_days, 1),
+              "comment_count": len(comment_tss), "min_gap_hours": min_gap_hours},
+    )]
+
+
 def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic]:
     """>= cfg["block_cycle_threshold"] (default 3) blocked-after-unblocked
     cycles within cfg["block_cycle_window_seconds"] (default 24h). Complements
@@ -676,6 +757,68 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
         last_seen_at=int(last_cycle_blocked_ts) if last_cycle_blocked_ts else int(now),
         count=cycles,
         data={"cycles": cycles, "window_seconds": int(window_seconds)},
+    )]
+
+
+def _rule_stale_untouched_todo(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ``todo`` card >= cfg["stale_todo_days"] (default 14) old, with zero
+    ``claimed``/``spawned``/``commented`` events ever and no open parent
+    link — genuinely nothing structural to wait on, and nobody has ever
+    touched it.
+
+    ``status == 'todo'`` alone is NOT a neglect signal: the most common shape
+    of a long-lived todo card is a root task gated by ``_parents_satisfied()``
+    on an in-flight child (verified live: t_01697e00 sat in `todo` for 6+
+    weeks with 5 of 6 decomposed children done, waiting on the 6th,
+    t_1c68c712 — not neglect). Scope tightly on "no open parent link at
+    all" so the dependency gate can never explain the silence here, same
+    graph-aware convention as ``_rule_running_with_open_parents``: returns
+    ``[]`` when no graph context is available rather than risk a false
+    positive from an unknown parent set.
+
+    No severity/tag filter for safety- or approval-relevance is applied
+    here by design — this rule reports the structural fact (stale,
+    untouched, nothing to wait on); classifying it ACT/FYI/INTERNAL is the
+    digest's job (see ``guard-and-watchdog-alerting`` skill), not the rule
+    engine's.
+    """
+    if _task_field(task, "status") != "todo":
+        return []
+    graph = cfg.get("_graph")
+    if not isinstance(graph, dict):
+        return []
+    open_parents = [
+        p for p in (graph.get("parents") or [])
+        if isinstance(p, dict) and p.get("id") and p.get("status") not in ("done", "archived")
+    ]
+    if open_parents:
+        return []
+    created_at = int(_task_field(task, "created_at", 0) or 0)
+    if created_at == 0:
+        return []
+    days_threshold = float(cfg.get("stale_todo_days", 14))
+    age_days = (now - created_at) / 86400.0
+    if age_days < days_threshold:
+        return []
+    if any(_event_kind(ev) in {"claimed", "spawned", "commented"} for ev in events):
+        return []
+
+    task_id = str(_task_field(task, "id") or "")
+    age_str = f"{age_days:.1f}d"
+    return [Diagnostic(
+        kind="stale_untouched_todo", severity="warning",
+        title=f"Todo for {age_str} with zero activity and nothing to wait on",
+        detail=(
+            f"This task has sat in `todo` for {age_str} with no claim, no spawn attempt, and no "
+            f"comment — and it has no open parent link, so the usual \"it's gated on an in-flight "
+            f"dependency\" explanation does not apply. Check whether it is still wanted, needs "
+            f"reassignment, or was simply never picked up."
+        ),
+        actions=[_cli_hint(f"Check task detail: hermes kanban show {task_id}",
+                           f"hermes kanban show {task_id}", suggested=True),
+                 DiagnosticAction(kind="reassign", label="Reassign or promote to ready")],
+        first_seen_at=created_at, last_seen_at=created_at, count=1,
+        data={"created_at": created_at, "age_days": round(age_days, 1)},
     )]
 
 
@@ -817,7 +960,9 @@ _RULES: list[RuleFn] = [
     _rule_review_dependency_deadlock,
     _rule_running_with_open_parents,
     _rule_stuck_in_blocked,
+    _rule_blocked_stale_despite_comments,
     _rule_block_unblock_cycling,
+    _rule_stale_untouched_todo,
     _rule_stranded_in_ready,
     _rule_stale_running,
 ]
@@ -831,6 +976,14 @@ DEFAULT_CONFIG = {
     "spawn_failure_threshold": 2,
     "crash_threshold": 2,
     "blocked_stale_hours": 24,
+    # Complement to blocked_stale_hours: _rule_stuck_in_blocked's clock resets
+    # on any comment, so this blunter rule fires on long-blocked cards whose
+    # comments never actually changed status (periodic audits, not answers).
+    "blocked_audit_stale_days": 7,
+    "blocked_audit_min_gap_hours": 24,
+    # Stale, untouched `todo` card with no open parent link (nothing
+    # structural to explain the silence) — see _rule_stale_untouched_todo.
+    "stale_todo_days": 14,
     # Below 30 min the signal is dominated by tasks about to be claimed on
     # the next dispatcher tick.
     "stranded_threshold_seconds": 30 * 60,
