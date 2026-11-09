@@ -4,13 +4,16 @@ Inspired by Claude Cowork (desktop changelog v1.46388.1, 2026-09-04): "automatic
 (after 5, 15, and 30 minutes) for a scheduled task that could not reach the model at all,
 for example right after the computer wakes behind a VPN."
 
-The class is deliberately narrow: the run must have FAILED with a transient network /
-DNS error (``cron.scheduler_preflight._is_transient_provider_resolve_error``) AND the
-agent must have completed zero API calls. Nothing was executed and nothing was spent, so
-re-running cannot double a side effect — unlike a generic failure retry (see PR #16512),
-which has to answer for one-shot dispatch accounting and mid-run side effects. Recurring
-jobs only: finite one-shots are pre-claimed by ``claim_dispatch`` (at-most-times, #38758)
-and must not regain a consumed dispatch here.
+The class is deliberately narrow: the run must have FAILED with either a transient network /
+DNS error (``cron.scheduler_preflight._is_transient_provider_resolve_error``) or the local
+gateway itself refusing the fire because ``hermes update`` was draining it
+(``_is_gateway_update_pause_error`` — #309424: a cron fire landing in the few seconds a gateway
+update holds the install used to record a hard failure with no retry) AND the agent must have
+completed zero API calls. Nothing was executed and nothing was spent, so re-running cannot
+double a side effect — unlike a generic failure retry (see PR #16512), which has to answer for
+one-shot dispatch accounting and mid-run side effects. Recurring jobs only: finite one-shots
+are pre-claimed by ``claim_dispatch`` (at-most-times, #38758) and must not regain a consumed
+dispatch here.
 
 While a retry is pending the failure notice is suppressed (Cowork re-runs silently); a
 run that reaches the model — success or not — resets the ladder. Disable with
@@ -56,13 +59,38 @@ def retry_enabled(cfg: Optional[dict] = None) -> bool:
 
 
 def is_model_unreachable_failure(exc: BaseException, agent: Any = None) -> bool:
-    """True when *exc* is a transient network/DNS failure and *agent* (may be ``None``)
-    never completed a model call — the run consumed nothing and executed nothing."""
+    """True when *exc* is a transient network/DNS failure, or the local gateway itself refused
+    the fire because an update was draining it (see ``_is_gateway_update_pause_error``), and
+    *agent* (may be ``None``) never completed a model call — the run consumed nothing and
+    executed nothing."""
     if int(getattr(agent, "session_api_calls", 0) or 0) > 0:
         return False
     from cron.scheduler_preflight import _is_transient_provider_resolve_error
 
-    return _is_transient_provider_resolve_error(exc)
+    return _is_transient_provider_resolve_error(exc) or _is_gateway_update_pause_error(exc)
+
+
+def _is_gateway_update_pause_error(exc: BaseException) -> bool:
+    """True when *exc* (or its cause chain) is the local gateway refusing to admit this fire
+    because ``hermes update`` is draining it for the duration of the install
+    (``GatewayUnavailableError`` with ``state == "draining"``, reason ``update_paused`` — see
+    ``hermes_cli.gateway_client.connect_gateway``). A tool call that needs to dial the gateway
+    mid-fire (``delegate_task``, a kanban tool, a subagent spawn, ...) raises this before
+    anything is submitted — ``GatewayUnavailableError``'s own contract — so the same bounded
+    ladder that re-runs a network-unreachable fire applies with identical safety: an
+    update-pause window is self-clearing in well under the 5-minute first rung, so the retry
+    almost always lands on an already-healthy gateway instead of waiting a full schedule period
+    for one bad-timing coincidence (#309424)."""
+    from hermes_cli.gateway_client import GatewayUnavailableError
+
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, GatewayUnavailableError) and cur.state == "draining" and "update_paused" in str(cur):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 def _ladder_applies(job: dict[str, Any]) -> bool:

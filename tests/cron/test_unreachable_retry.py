@@ -77,6 +77,52 @@ def test_unreachable_failure_pulls_next_run_earlier_then_ladder_exhausts(
     assert weekly["id"] not in {due["id"] for due in get_due_jobs()}
 
 
+def test_gateway_update_pause_classifies_as_unreachable(monkeypatch):
+    """A tool call that needed to dial the gateway mid-fire and got refused because
+    ``hermes update`` was draining it (t_309424b0) classifies exactly like a network-unreachable
+    failure: zero API calls, local gateway refusal, retryable. A different gateway refusal
+    reason (e.g. ``starting: not_ready``) must NOT be swept in — only the specific, provably
+    short-lived update-pause window is safe to auto-retry blind."""
+    from hermes_cli.gateway_client import GatewayUnavailableError
+
+    update_pause = GatewayUnavailableError("Gateway draining: update_paused", "draining")
+    assert ur.is_model_unreachable_failure(update_pause) is True
+    assert ur._is_gateway_update_pause_error(update_pause) is True
+
+    # Wrapped in a cause chain (as run_job's agent loop would re-raise it from a tool call).
+    wrapped = RuntimeError("tool call failed")
+    wrapped.__cause__ = update_pause
+    assert ur.is_model_unreachable_failure(wrapped) is True
+
+    # Any real work already done must still block the auto-retry (no doubled side effects).
+    class _Agent:
+        session_api_calls = 3
+
+    assert ur.is_model_unreachable_failure(update_pause, _Agent()) is False
+
+    # A different (non-update) gateway refusal reason is not swept into the retry.
+    not_ready = GatewayUnavailableError("Gateway starting: not_ready", "starting")
+    assert ur.is_model_unreachable_failure(not_ready) is False
+
+
+def test_gateway_update_pause_failure_drives_the_same_ladder(tmp_cron_home):
+    """End-to-end: a cron job whose run failed on ``GatewayUnavailableError:
+    Gateway draining: update_paused`` gets ``next_run_at`` pulled to the 5-minute rung instead
+    of being recorded as a dead-end hard failure (the exact gap t_309424b0 reported)."""
+    job = create_job("daily domain audit", "every 24h")
+    job_id = job["id"]
+    now = datetime.now(UTC)
+
+    assert mark_job_run(
+        job_id, False, "GatewayUnavailableError: Gateway draining: update_paused",
+        model_unreachable=True)
+    j = get_job(job_id)
+    assert j is not None
+    nxt = datetime.fromisoformat(j["next_run_at"])
+    assert timedelta(0) < nxt - now <= timedelta(seconds=ur.RETRY_DELAYS_SECONDS[0] + 120)
+    assert j[ur.STATE_KEY]["attempt"] == 1
+
+
 def test_will_retry_mirrors_plan_retry_yield(tmp_cron_home):
     """``will_retry`` answers True only when ``plan_retry`` would park a re-run. Called after
     ``mark_job_run`` — valid, the predictor reads only persisted job state."""
