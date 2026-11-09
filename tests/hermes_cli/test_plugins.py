@@ -1392,6 +1392,45 @@ class TestForceReloadSymmetry:
 
         assert len(starts) == 2
 
+    def test_concurrent_session_starts_with_distinct_session_ids_both_run(self, monkeypatch):
+        """Regression: on_session_start carries no tool_call_id/turn_id, so before
+        on_session_start/on_session_end had an identity-field entry, every session's call
+        collapsed onto the same gate key. Two sessions starting at once (e.g. a delegate_task
+        batch spawning several subagent sessions together) must both fire the callback, not
+        have the second silently skipped as "still running" for the first's unrelated session
+        (live incident: kanban task t_ee597ae4, 1 of 6 concurrent subagent session starts
+        dropped the hook)."""
+        import time
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 5.0
+        )
+
+        hold = threading.Event()
+        starts = []
+
+        def recorder(**_kwargs):
+            starts.append(1)
+            hold.wait(timeout=10.0)
+            return "ok"
+
+        mgr = PluginManager()
+        mgr._hooks["on_session_start"] = [recorder]
+
+        def fire(session_id):
+            mgr.invoke_hook("on_session_start", session_id=session_id, model="m", platform="")
+
+        first = threading.Thread(target=fire, args=("session-a",), daemon=True)
+        first.start()
+        time.sleep(0.1)  # let the first invocation occupy the gate
+        second = threading.Thread(target=fire, args=("session-b",), daemon=True)
+        second.start()
+        time.sleep(0.4)
+        hold.set()
+        first.join(5.0)
+        second.join(5.0)
+
+        assert len(starts) == 2
+
     def test_repeated_same_call_identity_still_deduplicated(self, monkeypatch):
         """Negative control: the same call identity stays a duplicate while its worker
         is still running, so the running gate (not timeout suppression) dedupes it."""
