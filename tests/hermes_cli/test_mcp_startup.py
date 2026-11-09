@@ -485,6 +485,62 @@ def test_lazy_only_discovery_counts_as_usable_at_both_startup_sites(monkeypatch,
     assert any("retrying discovery thread" in w for w in warnings) is retried
 
 
+def test_zero_configured_servers_rearms_silently_on_second_call(monkeypatch):
+    """A profile with NO ``mcp_servers`` configured at all (e.g. harness, or any profile that
+    simply doesn't use MCP) must never see the "previously exited with no connected servers;
+    retrying" warning. ``start_background_mcp_discovery`` runs twice in-process for a normal
+    `chat -q` (main.py startup, then oneshot.py's ensure_mcp_discovery_before_agent_build /
+    tui_gateway.entry's retry-spawn) -- the second call must re-arm quietly instead of logging a
+    misleading warning and retrying discovery for a profile with nothing to discover.
+
+    Regression test for t_1cdfccd5: the first fix landed clean, then a later rewrite of this
+    same retry block (a0528365596, "connect servers added to config on the next agent build")
+    silently dropped the guard with no test to catch it, and the warning recurred on the david
+    profile (t_9fc4632d). This test exists so a third rewrite can't drop it again unnoticed.
+    """
+    calls = {"mcp": 0}
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(read_raw_config=dict),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.agent_plugins",
+        types.SimpleNamespace(has_enabled_agent_plugin_mcp=lambda _config: False),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_oauth",
+        types.SimpleNamespace(suppress_interactive_oauth=lambda: nullcontext()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool_discovery",
+        types.SimpleNamespace(
+            discover_mcp_tools=lambda: calls.__setitem__("mcp", calls["mcp"] + 1),
+            get_mcp_status=list,
+        ),
+    )
+    warnings: list = []
+    logger = types.SimpleNamespace(debug=lambda *_a, **_k: None,
+                                   warning=lambda msg, *a, **_k: warnings.append(msg % a if a else msg))
+
+    assert mcp_startup._has_configured_mcp_servers() is False
+
+    mcp_startup.start_background_mcp_discovery(logger=logger, thread_name="t")  # 1st call (main.py)
+    thread = mcp_startup._current_home_thread()
+    if thread is not None:
+        thread.join(timeout=5.0)
+    mcp_startup.start_background_mcp_discovery(logger=logger, thread_name="t")  # 2nd call (oneshot.py)
+    thread = mcp_startup._current_home_thread()
+    if thread is not None:
+        thread.join(timeout=5.0)
+
+    assert calls["mcp"] == 0  # nothing configured -- discovery never actually spawned
+    assert not any("retrying discovery thread" in w for w in warnings)
+
+
 def test_server_added_after_discovery_is_connected_by_the_next_agent_build(monkeypatch, tmp_path):
     """#76954: ``hermes mcp add`` against a running Desktop backend. Discovery already ran and left
     ``github`` live, so the re-entry every agent build makes returned early and the new server's

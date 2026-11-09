@@ -112,6 +112,19 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
                 return
             if connected and not pending:
                 return
+            if not connected and not _has_configured_mcp_servers():
+                # Nothing was ever configured for this profile home, so there is no prior
+                # "exit" and nothing to retry -- just re-arm silently. Without this check,
+                # every zero-mcp-server profile logs this warning on every second in-process
+                # call to start_background_mcp_discovery (main.py startup + oneshot.py /
+                # tui_gateway.entry's retry-spawn). Originally fixed at t_1cdfccd5; the guard
+                # was lost when a0528365596 ("connect servers added to config on the next
+                # agent build") rewrote this same retry block without carrying it forward --
+                # recurred on the david profile at t_9fc4632d. Re-added here; cover with a
+                # regression test (test_mcp_startup.py) so a future rewrite can't drop it again.
+                _mcp_discovery_started.discard(home_key)
+                _mcp_discovery_thread.pop(home_key, None)
+                return
             if connected:
                 logger.info("MCP server(s) %s not connected yet; running discovery", ", ".join(pending))
             else:
