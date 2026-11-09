@@ -1655,6 +1655,34 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
     return _CronJobConfig(_cfg, model, _model_cfg, _cron_default_provider)
 
 
+# Native providers whose API only ever serves ids carrying this vendor prefix. Anthropic's direct
+# Messages API (api.anthropic.com) has never served a bare ``sonnet-*`` / ``opus-*`` id — every real
+# model is ``claude-*`` — so a resolved model missing the prefix can only be a config/alias mistake
+# (e.g. ``sonnet-5`` typed or produced where ``claude-sonnet-5`` was meant). Extend this table before
+# adding the same guard for another provider; it is intentionally a short, cheap, no-network check.
+_PROVIDER_REQUIRED_MODEL_PREFIXES: dict[str, str] = {"anthropic": "claude-"}
+
+
+def _validate_resolved_model(provider: Optional[str], model: str, job_id: str, job_name: str) -> None:
+    """Fail loud, before the first API call, when a resolved model can't belong to its resolved
+    provider. See #<incident 2026-11-07>: a cron job resolved model=claude-sonnet-5 (config-correct,
+    confirmed live on Anthropic's /v1/models) but the wire request carried the bare ``sonnet-5`` —
+    the job retried 3x against a 404 over several seconds before dying with an opaque
+    ``HTTP 404: model: sonnet-5``, and the same shape killed a different job 5 days earlier. This
+    guard does not know *why* the prefix went missing upstream; it only refuses to let a
+    structurally-impossible id reach the API, trading a silent multi-retry death for one clear,
+    immediate diagnosis naming the job and the bad id."""
+    required = _PROVIDER_REQUIRED_MODEL_PREFIXES.get((provider or "").strip().lower())
+    if required and model and not model.lower().startswith(required):
+        raise RuntimeError(
+            f"Job '{job_name}' ({job_id}) resolved to model {model!r} for provider {provider!r}, "
+            f"which is missing the required {required!r} prefix for that provider and would 404 "
+            "instead of running. Check the job's --model pin, the cron.model fleet default, and "
+            "model.default in config.yaml for a value that lost its vendor prefix "
+            f"(e.g. 'sonnet-5' instead of '{required}sonnet-5')."
+        )
+
+
 def _load_prefill_messages(cfg: dict, job_id: str) -> Optional[list]:
     """Prefill messages from env or config.yaml (top-level key canonical; agent.* is legacy)."""
     agent_cfg = cfg.get("agent", {}) if isinstance(cfg.get("agent", {}), dict) else {}
@@ -2460,6 +2488,11 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
     setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)
     setup.fallback_notice = setup.runtime.pop("_fallback_notice", None)
+    # Cheap, no-network sanity check before the agent is even constructed: a model that can't
+    # possibly belong to its resolved provider (#2026-11-07 incident — see
+    # _validate_resolved_model) must fail loud here instead of retry-looping a 404 three times
+    # and killing the job silently.
+    _validate_resolved_model(setup.runtime.get("provider"), str(setup.model or ""), job_id, job_name)
     setup.reasoning_config = _resolve_job_reasoning_config(
         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
     )
