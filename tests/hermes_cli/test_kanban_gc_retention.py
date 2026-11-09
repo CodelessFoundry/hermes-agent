@@ -221,3 +221,41 @@ def test_cleanup_workspace_keeps_scratch_when_other_boards_cannot_be_listed(boar
         kbw._cleanup_workspace(conn, archived)
         assert _deferred_reasons(conn, archived) == ["shared", "shared", "unknown"]
     assert (shared / "note.txt").read_text(encoding="utf-8") == "still needed"
+
+
+def test_cleanup_workspace_ignores_stray_default_board_stub(board):
+    """A 0-byte/schema-less file at boards/default/kanban.db must never break
+    the sibling-board scan. ``default`` is deliberately excluded from
+    boards_root() by design (board_dir()'s docstring: its DB stays at
+    <home>/kanban.db) -- a file there is always a stray resurrection stub
+    (#43243-class), never the live default board. Before the fix this made
+    sqlite3 auto-vivify an empty file on open and the scan died with
+    "no such table: tasks" (t_142f11ed, t_5d79202f: the same stub, surfaced
+    twice by two different unguarded scanners -- see
+    hermes-state/scripts/estate_health_signatures.py for the sibling fix)."""
+    from hermes_cli import kanban_db_workspace as kbw
+
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="done with workspace")
+        ws = kb.workspaces_root() / tid
+        ws.mkdir(parents=True)
+        (ws / "scratch.txt").write_text("keep me", encoding="utf-8")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', workspace_kind='scratch', "
+                "workspace_path=? WHERE id=?",
+                (str(ws), tid),
+            )
+
+    # The stray stub: present on disk, zero bytes, no schema -- exactly what
+    # sqlite3.connect(..., mode=ro) opens successfully but has no 'tasks' table.
+    stub_dir = kb.boards_root() / "default"
+    stub_dir.mkdir(parents=True, exist_ok=True)
+    (stub_dir / "kanban.db").touch()
+
+    with kbc.connect_closing() as conn:
+        kbw._cleanup_workspace(conn, tid)
+        # Must be cleaned, not deferred: a stray boards/default/kanban.db
+        # is excluded from the sibling scan, so there is nothing "unknown".
+        assert _deferred_reasons(conn, tid) == []
+    assert not ws.exists()
