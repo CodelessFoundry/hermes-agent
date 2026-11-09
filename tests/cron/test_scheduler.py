@@ -20,6 +20,7 @@ from cron.scheduler import (
     _resolve_cron_enabled_toolsets,
     _resolve_delivery_target,
     _summarize_cron_failure_for_delivery,
+    _validate_resolved_model,
 )
 from cron.scheduler_delivery import _resolve_origin, _send_media_via_adapter
 from tools.env_passthrough import clear_env_passthrough
@@ -190,6 +191,42 @@ class TestPerJobToolsetMcpMerge:
         assert _resolve_cron_enabled_toolsets(
             {"enabled_toolsets": ["nonexistent_ts"]}, {"platform_toolsets": "oops", "mcp_servers": {}}
         ) == ["nonexistent_ts"]
+
+class TestValidateResolvedModel:
+    """Guard against a resolved model missing its provider's required vendor prefix —
+    see t_0343281a: a job resolved model=claude-sonnet-5 but the wire request carried the
+    bare `sonnet-5`, which 404s 3x before dying with an opaque error. This guard fails
+    loud, immediately, naming the job and the bad id, instead of letting that happen."""
+
+    def test_anthropic_model_missing_claude_prefix_raises(self):
+        with pytest.raises(RuntimeError, match="sonnet-5"):
+            _validate_resolved_model("anthropic", "sonnet-5", "job-1", "My Job")
+
+    def test_anthropic_model_with_claude_prefix_is_fine(self):
+        _validate_resolved_model("anthropic", "claude-sonnet-5", "job-1", "My Job")
+
+    def test_non_anthropic_provider_is_not_checked(self):
+        # Only anthropic has a required-prefix entry today; any other provider's model
+        # (whatever shape it takes) must pass through untouched.
+        _validate_resolved_model("openai", "sonnet-5", "job-1", "My Job")
+
+    def test_unknown_provider_is_not_checked(self):
+        _validate_resolved_model(None, "sonnet-5", "job-1", "My Job")
+        _validate_resolved_model("", "sonnet-5", "job-1", "My Job")
+
+    def test_empty_model_is_not_checked(self):
+        # An empty/unresolved model is a different failure mode (caught elsewhere);
+        # this guard only rejects a non-empty, structurally-wrong id.
+        _validate_resolved_model("anthropic", "", "job-1", "My Job")
+
+    def test_error_names_the_job(self):
+        with pytest.raises(RuntimeError, match="job-42"):
+            _validate_resolved_model("anthropic", "opus-5-5", "job-42", "Nightly Report")
+
+    def test_provider_match_is_case_insensitive(self):
+        with pytest.raises(RuntimeError):
+            _validate_resolved_model("Anthropic", "sonnet-5", "job-1", "My Job")
+
 
 class TestResolveOrigin:
 
