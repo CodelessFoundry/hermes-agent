@@ -459,6 +459,18 @@ def decompose_task(
     return _apply_fanout(task_id, parsed, routing, audit_author)
 
 
+#: Per-run bookkeeping events, never a board decision. ``gateway/session_kanban.py``
+#: appends ``worker_bound``/``owner_admitted`` as a run starts and ALWAYS appends
+#: ``worker_result`` when it ends — including the very run that just wrote
+#: ``block_loop_detected`` mid-turn before exiting. ``kanban_db_dispatch.py`` adds
+#: ``claimed``/``spawned``/``heartbeat`` the same way. None of these represent a
+#: human or the board acting on the card; they are the dispatcher narrating its
+#: own process lifecycle and must never be read as "something moved this card on".
+_RUN_LIFECYCLE_EVENT_KINDS = frozenset({
+    "claimed", "spawned", "owner_admitted", "worker_bound", "heartbeat", "worker_result",
+})
+
+
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column, EXCLUDING cards that
     landed there via the unblock-loop breaker (``block_loop_detected``).
@@ -480,24 +492,47 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     A card stuck on an approval/grant problem needs that problem fixed (or a
     human decision), not an LLM's best guess at a different task.
 
-    The most recent ``task_events`` row is the signal: right after
-    ``_route_block`` writes ``block_loop_detected`` the card sits in triage
-    with that as its newest event, until something else (a decompose, a
-    comment, a manual promote) moves it on. A genuinely fresh triage card's
-    newest event is ``created``/``commented``/etc. — untouched by this.
+    The most recent *substantive* ``task_events`` row is the signal: right
+    after ``_route_block`` writes ``block_loop_detected`` the card sits in
+    triage with that as its newest decision-relevant event, until something
+    else (a comment, an unblock, a manual promote) moves it on. A genuinely
+    fresh triage card's newest substantive event is ``created``/``commented``
+    /etc. — untouched by this.
+
+    FIXED 2026-11-09 (t_42a8ab05, real incident t_982a6f2f on the tech
+    board): the original check used the literal last ``task_events`` row
+    (``ORDER BY id DESC LIMIT 1``), which assumed ``block_loop_detected``
+    would still be it. It never is in production — every run, including the
+    one that just wrote ``block_loop_detected``, ends by appending
+    ``worker_result`` (see ``_RUN_LIFECYCLE_EVENT_KINDS`` above), so the real
+    newest row for a just-loop-broken card is always ``worker_result``, not
+    ``block_loop_detected``. The exclusion was therefore a near-total no-op:
+    it only fired if nothing ever ran that card's dispatcher lifecycle again,
+    which does not happen. t_982a6f2f hit the loop breaker, its run ended
+    (appending ``worker_result`` as always), and three minutes later the
+    unprotected tick swept it into the decomposer anyway — fanning it into 4
+    child tasks and burying the still-unresolved
+    ``APPROVAL-REQUEST: create/dns_record`` decision inside a rewritten
+    child body. Fixed by skipping run-lifecycle bookkeeping kinds and asking
+    for the newest event that is NOT one of them, so a card whose last
+    *meaningful* event is ``block_loop_detected`` is excluded regardless of
+    how many bookkeeping rows the dispatcher appended afterward.
 
     This only narrows the AUTOMATIC tick's candidate pool. A human can still
     force it via ``hermes kanban decompose <id>`` (calls ``decompose_task``
     directly, bypassing this list) if a loop-broken card genuinely does need
     re-specification.
     """
+    placeholders = ",".join("?" * len(_RUN_LIFECYCLE_EVENT_KINDS))
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
         ids = []
         for row in rows:
             event = conn.execute(
-                "SELECT kind FROM task_events WHERE task_id = ? "
-                "ORDER BY id DESC LIMIT 1", (row.id,),
+                f"SELECT kind FROM task_events WHERE task_id = ? "
+                f"AND kind NOT IN ({placeholders}) "
+                "ORDER BY id DESC LIMIT 1",
+                (row.id, *_RUN_LIFECYCLE_EVENT_KINDS),
             ).fetchone()
             if event and event["kind"] == "block_loop_detected":
                 logger.debug(
