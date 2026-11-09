@@ -136,7 +136,16 @@ def _sibling_board_db_files(conn: sqlite3.Connection) -> list[Path]:
     root = _kb.boards_root()
     if root.is_dir():
         for child in root.iterdir():
-            if child.is_dir():
+            # ``default`` is deliberately excluded from ``boards_root()`` by
+            # design (board_dir()'s own docstring: its DB stays at
+            # ``<home>/kanban.db``, already the first candidate above). A
+            # ``boards/default/kanban.db`` file is never the live default
+            # board -- at best a stale stub from a bygone resurrection bug
+            # (#43243-class), which this scan would otherwise open and choke
+            # on with "no such table: tasks" (see t_142f11ed, t_5d79202f).
+            # list_boards() already excludes this dir the same way; mirror it
+            # here so a future stray file there can't break this scan again.
+            if child.is_dir() and child.name != _kb.DEFAULT_BOARD:
                 candidates.append(child / "kanban.db")
     found: list[Path] = []
     seen: set[Path] = set()
