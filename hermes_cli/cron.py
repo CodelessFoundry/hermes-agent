@@ -702,12 +702,48 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
     return f"next_run_at is {amount} overdue — job is not firing (is the scheduler running?)"
 
 
+# How long a Bot Chat delivery may sit "queued" before doctor calls it stuck rather than just
+# in flight. `list_jobs()` re-polls the live mailbox on every call (see refresh_queued_bot_chat_
+# deliveries) and clears this the moment the receipt settles — real settles observed in ~1 minute
+# (t_f3f9e75d) — so anything still queued past this grace is a genuine stall worth flagging, not
+# a race with an agent that is simply still thinking.
+_QUEUED_DELIVERY_STALE_SECONDS = 1800  # 30 minutes
+
+
+def _queued_delivery_issue(job: dict[str, Any]) -> Optional[str]:
+    """None, or an issue string, for a Bot Chat delivery still queued well past when it should
+    have settled. ``list_jobs()`` already tried to clear this via a live mailbox re-poll before
+    doctor ever sees the job, so a non-empty ``last_delivery_queued`` here means the receipt
+    itself is still ``queued``/``claimed`` — not just that nobody checked."""
+    queued = job.get("last_delivery_queued")
+    if not isinstance(queued, dict) or not queued:
+        return None
+    last_run_at = job.get("last_run_at")
+    age_s = None
+    if last_run_at:
+        from cron.jobs import _parse_aware
+        from hermes_time import now
+        dt = _parse_aware(last_run_at)
+        if dt is not None:
+            age_s = (now().astimezone(UTC) - dt.astimezone(UTC)).total_seconds()
+    if age_s is not None and age_s < _QUEUED_DELIVERY_STALE_SECONDS:
+        return None  # plausibly still in flight; not yet a doctor-worthy stall
+    age_label = _format_lateness(age_s) if age_s is not None else "an unknown duration"
+    targets = ", ".join(f"{target} (delivery_id={r.get('delivery_id', '?')})" for target, r in queued.items())
+    return (f"Bot Chat delivery stuck 'queued' for {age_label}, never confirmed: {targets}. "
+            "The message was admitted but never settled — check the target profile's gateway is "
+            "alive (`hermes cron status`) and whether its Bot Chat is backlogged; this does not "
+            "self-heal and `cron run` will not resend it.")
+
+
 def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
     # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
     if last_status and last_status not in {"ok", "delivery_failed", "delivery_queued"}:
         issues.append(f"last run failed: {str(job.get('last_error') or 'unknown error').strip()}")
+    if issue := _queued_delivery_issue(job):
+        issues.append(issue)
     if delivery_err := str(job.get("last_delivery_error") or "").strip():
         issues.append(f"last run finished but the result was not delivered ({_short_reason(delivery_err)}). "
                       f"{_delivery_fix_hint(job)}")

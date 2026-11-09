@@ -1103,6 +1103,86 @@ def _record_delivery_verification(job: dict, unverified_targets: list) -> None:
         logger.debug("Job '%s': could not record delivery verification: %s", job.get("id"), exc)
 
 
+def _bot_chat_receipt_home(profile_label: str):
+    """Map a stored ``last_delivery_queued`` target label back to the Path home whose mailbox
+    holds the receipt — the inverse of the ``profile_label = profile or "(own)"`` stamp
+    ``_deliver_to_bot_chat`` writes at admission time. None when the profile no longer resolves
+    (deleted/renamed since admission) — callers must treat that as "still unknown", not settled.
+    """
+    from hermes_constants import get_hermes_home
+
+    if profile_label in ("", "(own)"):
+        return get_hermes_home().resolve()
+    try:
+        from hermes_cli.profiles import get_profile_dir
+
+        return get_profile_dir(profile_label).resolve()
+    except Exception:
+        return None
+
+
+def refresh_queued_bot_chat_deliveries(job: dict) -> Optional[dict]:
+    """Re-poll this job's still-``queued``/``claimed`` Bot Chat receipts against their live
+    mailbox and write back a settled outcome. Returns the updated job record when anything
+    changed, else None. Never raises: a read/profile-resolution failure just leaves the entry
+    queued for the next check.
+
+    Needed because ``_record_delivery_verification`` stamps ``last_delivery_queued`` exactly
+    once, at the moment THIS job's own run ends — admission to another profile's Bot Chat is
+    immediate, but that profile's agent actually processing and replying to the turn can take
+    anywhere from seconds to minutes, after this job's process has already exited. Nothing
+    polled the mailbox again afterward, so ``hermes cron list``/``cron doctor`` kept reporting
+    "delivery still in progress" forever even once the message had actually landed and been
+    replied to (t_f3f9e75d, backup-watchdog settled ~1 min after firing but stayed shown as
+    stuck for 24h+).
+    """
+    queued = job.get("last_delivery_queued")
+    if not isinstance(queued, dict) or not queued:
+        return None
+    from tools.bot_live_delivery import read_delivery_result
+
+    still_queued: dict = {}
+    settle_errors: list[str] = []
+    changed = False
+    for target, receipt in queued.items():
+        delivery_id = (receipt or {}).get("delivery_id") if isinstance(receipt, dict) else None
+        if not isinstance(delivery_id, str) or not delivery_id:
+            changed = True  # malformed entry: drop rather than carry forever
+            continue
+        label = target.split(":", 1)[1] if ":" in target else "(own)"
+        home = _bot_chat_receipt_home(label)
+        if home is None:
+            still_queued[target] = receipt
+            continue
+        try:
+            result = read_delivery_result(home, delivery_id)
+        except Exception:
+            still_queued[target] = receipt
+            continue
+        result_dict: dict = result if isinstance(result, dict) else {}
+        status = result_dict.get("status")
+        if status in (None, "queued", "claimed"):
+            still_queued[target] = receipt
+            continue
+        changed = True
+        if status not in ("settled", "suppressed"):
+            detail = result_dict.get("error") or result_dict.get("reason") or f"bot-chat delivery {status}"
+            settle_errors.append(f"{target} {status}: {detail}")
+    if not changed:
+        return None
+    updates: dict = {"last_delivery_queued": still_queued or None}
+    if not still_queued:
+        if settle_errors:
+            updates["last_status"] = "delivery_failed"
+            updates["last_delivery_error"] = "; ".join(settle_errors)
+        elif job.get("last_status") == "delivery_queued":
+            updates["last_status"] = "ok"
+            updates["last_delivery_error"] = None
+    from cron.jobs import update_job
+
+    return update_job(job["id"], updates)
+
+
 @dataclass
 class _TargetDelivery:
     """Per-target delivery state shared by the live-adapter and standalone lanes."""

@@ -1999,6 +1999,18 @@ def list_jobs(include_disabled: bool = False) -> list[dict[str, Any]]:
     for job in jobs:
         job["latest_execution"] = latest.get(job.get("id", ""))
         job["live_execution"] = live.get(job.get("id", ""))
+        # A Bot Chat delivery settles minutes after THIS job's run already stamped
+        # last_delivery_queued; re-poll the live mailbox here so list/doctor show the real
+        # outcome instead of a stale "still in progress" forever (t_f3f9e75d). Read-only
+        # unless the receipt actually moved; never allowed to break a listing.
+        if job.get("last_delivery_queued"):
+            try:
+                from cron.scheduler_delivery import refresh_queued_bot_chat_deliveries
+                refreshed = refresh_queued_bot_chat_deliveries(job)
+                if refreshed:
+                    job.update(refreshed)
+            except Exception:
+                logger.debug("Job '%s': bot-chat receipt refresh failed", job.get("id"), exc_info=True)
     return jobs
 
 
