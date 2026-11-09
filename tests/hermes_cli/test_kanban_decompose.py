@@ -256,3 +256,72 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_list_triage_ids_excludes_block_loop_detected(kanban_home):
+    """t_48b8d912: a card routed to triage by the unblock-loop breaker (not a
+    genuinely underspecified card) must not be swept up by the auto-decompose
+    tick. Real incident: t_ab79a0c2 (an approved, fully-specified UDM-SE
+    test) hit this path twice and had its title/body rewritten by the LLM
+    decomposer while it was actually stuck on an unrelated grant bug."""
+    with kbc.connect() as conn:
+        looped = kb.create_task(conn, title="stuck on approval", triage=True)
+        fresh = kb.create_task(conn, title="genuinely rough idea", triage=True)
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'block_loop_detected', '{}', strftime('%s','now'))",
+            (looped,),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, 'created', '{}', strftime('%s','now'))",
+            (fresh,),
+        )
+
+    ids = decomp.list_triage_ids()
+    assert looped not in ids, "block_loop_detected card must be excluded"
+    assert fresh in ids, "a genuinely fresh triage card must still be picked up"
+
+
+def test_list_triage_ids_excludes_block_loop_detected_even_after_worker_result(kanban_home):
+    """t_42a8ab05 (2026-11-09), real incident: t_982a6f2f on the tech board.
+
+    The t_48b8d912 fix above assumed ``block_loop_detected`` would still be
+    the NEWEST ``task_events`` row when the auto-decompose tick ran. It never
+    is in production: ``gateway/session_kanban.py::_record_worker_result``
+    unconditionally appends a ``worker_result`` event when ANY run ends --
+    including the run that just wrote ``block_loop_detected`` mid-turn before
+    exiting. So the real row order for a loop-broken card is always
+    ``... -> block_loop_detected -> worker_result``, and the previous
+    ``ORDER BY id DESC LIMIT 1`` query read ``worker_result`` as the newest
+    kind, found no match, and let the card through to the LLM decomposer.
+
+    Measured live: t_982a6f2f hit the loop breaker at 2026-11-09 01:27:xx
+    (block_loop_detected), its run's worker_result landed at the same
+    wall-clock second but a higher event id, and the auto-decompose tick
+    swept it up 3 minutes later, fanning it into 4 child tasks and burying
+    the still-unresolved ``APPROVAL-REQUEST: create/dns_record`` decision
+    inside a rewritten child body -- the exact harm this exclusion exists to
+    prevent.
+    """
+    with kbc.connect() as conn:
+        looped = kb.create_task(conn, title="stuck on approval", triage=True)
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, 310, 'block_loop_detected', '{}', strftime('%s','now'))",
+            (looped,),
+        )
+        # The event every real run appends on exit, AFTER block_loop_detected,
+        # per gateway/session_kanban.py::_record_worker_result.
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, 310, 'worker_result', '{\"exit_code\": 0}', strftime('%s','now'))",
+            (looped,),
+        )
+
+    ids = decomp.list_triage_ids()
+    assert looped not in ids, (
+        "block_loop_detected card must stay excluded even though a "
+        "worker_result event (run-exit bookkeeping, not a board decision) "
+        "landed after it -- this is the real production event order"
+    )
+
+
