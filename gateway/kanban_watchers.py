@@ -22,8 +22,10 @@ from gateway.kanban_watchers_common import (
     _resolve_auto_decompose_settings,
     _gc_retention_days,
     _tracked_to_thread_process_service,
+    _tracked_to_thread_dedicated,
     logger,
 )
+from gateway.turn_executor import _UnboundedThreadExecutor
 from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
 from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
@@ -281,54 +283,74 @@ class GatewayKanbanWatchersMixin:
         results: Optional[list] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
 
-        logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
-        while self._running:
-            try:
-                # Reap zombies before per-board work so a board DB failure
-                # cannot block cleanup of unrelated workers.
-                from hermes_cli import kanban_db_dispatch as _kbd
-                pids = await _tracked_to_thread_process_service(self, _kbd.reap_worker_zombies)
-                if pids:
-                    logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
-            except Exception:
-                logger.exception("kanban dispatcher: zombie reaper failed")
+        # Dedicated executor for this loop's own blocking offloads (added 11 Nov,
+        # t_67e88746): before this, every tick shared the process-wide DEFAULT
+        # ThreadPoolExecutor (asyncio.to_thread's pool, min(32, cpu_count+4)) with a long
+        # list of unrelated gateway subsystems. A live incident showed that pool saturate
+        # for ~88 minutes with zero exception and zero log line — the dispatcher's own
+        # "stuck" WARNING below only fires AFTER a tick completes, so a tick that never got
+        # a thread never even reaches it. One thread is always enough: the three offloads
+        # below are strictly sequential within a tick, never concurrent with each other.
+        # See _to_thread_dedicated's docstring in kanban_watchers_common.py for the full
+        # writeup. Reuses the already-shipped _UnboundedThreadExecutor (gateway/turn_executor.py)
+        # rather than a plain ThreadPoolExecutor, so this dedicated pool can never itself
+        # become a second silent queue.
+        dispatcher_executor = _UnboundedThreadExecutor(thread_name_prefix="hermes-kanban-dispatch")
 
-            try:
-                # Emergency stop (`hermes pause`): no auto-decompose or
-                # dispatch while paused; running workers finish naturally.
-                if not _kanban_dispatch_allowed():
-                    bad_ticks = 0
-                else:
-                    # Re-read the auto-decompose toggle live so disabling it
-                    # takes effect on the next tick, not on restart.
-                    _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
-                    # See #49638.
-                    if _ad_enabled:
-                        # The aux-LLM call inside this tick is the slow, shutdown-vulnerable one
-                        # (#94736 — see _tracked_to_thread_process_service's docstring).
-                        await _tracked_to_thread_process_service(self, dispatcher.auto_decompose_tick, _ad_per_tick)
-                    results = await _tracked_to_thread_process_service(self, dispatcher.tick_once)
-                    any_spawned = _log_spawn_results(results)
-                    ready_pending = await _tracked_to_thread_process_service(self, dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
-                now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
-                    held = _kbd.describe_suppression(res for _slug, res in (results or []))
-                    logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned.%s Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks, f" Last tick held back: {held}." if held else "",
-                    )
-                    last_warn_at = now
-            except asyncio.CancelledError:
-                logger.debug("kanban dispatcher: cancelled")
-                self._release_kanban_dispatcher_lock()
-                raise
-            except Exception:
-                logger.exception("kanban dispatcher: unexpected watcher error")
+        def _offload(func, *args):
+            return _tracked_to_thread_dedicated(self, dispatcher_executor, func, *args)
 
-            await self._sleep_between_ticks(interval)
+        try:
+            logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
+            while self._running:
+                try:
+                    # Reap zombies before per-board work so a board DB failure
+                    # cannot block cleanup of unrelated workers.
+                    from hermes_cli import kanban_db_dispatch as _kbd
+                    pids = await _offload(_kbd.reap_worker_zombies)
+                    if pids:
+                        logger.info("kanban dispatcher: reaped %d zombie worker(s), pids=%s", len(pids), pids)
+                except Exception:
+                    logger.exception("kanban dispatcher: zombie reaper failed")
+
+                try:
+                    # Emergency stop (`hermes pause`): no auto-decompose or
+                    # dispatch while paused; running workers finish naturally.
+                    if not _kanban_dispatch_allowed():
+                        bad_ticks = 0
+                    else:
+                        # Re-read the auto-decompose toggle live so disabling it
+                        # takes effect on the next tick, not on restart.
+                        _ad_enabled, _ad_per_tick = _resolve_auto_decompose_settings(_load_config)
+                        # See #49638.
+                        if _ad_enabled:
+                            # The aux-LLM call inside this tick is the slow, shutdown-vulnerable one
+                            # (#94736 — see _tracked_to_thread_process_service's docstring).
+                            await _offload(dispatcher.auto_decompose_tick, _ad_per_tick)
+                        results = await _offload(dispatcher.tick_once)
+                        any_spawned = _log_spawn_results(results)
+                        ready_pending = await _offload(dispatcher.ready_nonempty)
+                        bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    now = int(time.time())
+                    if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+                        held = _kbd.describe_suppression(res for _slug, res in (results or []))
+                        logger.warning(
+                            "kanban dispatcher stuck: ready queue non-empty for "
+                            "%d consecutive ticks but 0 workers spawned.%s Check "
+                            "profile health (venv, PATH, credentials) and "
+                            "`hermes kanban list --status ready`.",
+                            bad_ticks, f" Last tick held back: {held}." if held else "",
+                        )
+                        last_warn_at = now
+                except asyncio.CancelledError:
+                    logger.debug("kanban dispatcher: cancelled")
+                    self._release_kanban_dispatcher_lock()
+                    raise
+                except Exception:
+                    logger.exception("kanban dispatcher: unexpected watcher error")
+
+                await self._sleep_between_ticks(interval)
+        finally:
+            dispatcher_executor.shutdown(wait=False)
 
         self._release_kanban_dispatcher_lock()

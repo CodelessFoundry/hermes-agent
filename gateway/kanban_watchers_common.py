@@ -66,6 +66,38 @@ async def _tracked_to_thread_process_service(gateway: Any, func: Callable[..., A
     return await future
 
 
+async def _to_thread_dedicated(executor: Any, func: Callable[..., Any], /, *args: Any) -> Any:
+    """Like :func:`_to_thread_process_service`, but runs on *executor* instead of the loop's
+    shared default ``ThreadPoolExecutor`` (``asyncio.to_thread``'s pool).
+
+    Added 11 Nov (t_67e88746): the embedded kanban dispatcher's tick was silently starved for
+    ~88 minutes because it shared that default pool (``min(32, cpu_count + 4)`` — 8 threads
+    on a 4-core box) with a long list of unrelated gateway subsystems (session housekeeping,
+    MCP reconcile, channel-directory builds, image staging, etc.) that also offload bare
+    blocking work via ``asyncio.to_thread()`` with no timeout. No exception and no log line
+    were produced — the dispatcher's "stuck: N consecutive ticks" WARNING only fires AFTER a
+    tick completes and updates its own counter, so a tick that never got a thread never even
+    starts that clock. Giving the dispatcher watcher its own dedicated executor (see
+    ``_kanban_dispatcher_watcher``) makes it immune to being starved by anything else in the
+    gateway, at the cost of nothing shared — the dispatcher's own tick work is already
+    strictly sequential (zombie reap, then auto-decompose, then dispatch), so it never needs
+    more than one thread at a time.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, _run_in_fresh_context, func, *args)
+
+
+async def _tracked_to_thread_dedicated(gateway: Any, executor: Any, func: Callable[..., Any],
+                                        /, *args: Any) -> Any:
+    """Like :func:`_tracked_to_thread_process_service`, but offloads onto *executor* instead
+    of the shared default pool — see :func:`_to_thread_dedicated` for why."""
+    future = asyncio.ensure_future(_to_thread_dedicated(executor, func, *args))
+    track = getattr(gateway, "_track_deferred_agent_worker", None)
+    if callable(track):
+        track(future, None)
+    return await future
+
+
 def _list_boards(kb: Any) -> list:
     """Enumerate live boards; fall back to the default board when listing fails."""
     try:
