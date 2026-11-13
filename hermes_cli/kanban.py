@@ -312,7 +312,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         ok = kbd.heartbeat_worker(conn, args.task_id, note=getattr(args, "note", None),
-                                 expected_run_id=_worker_run_id_for(args.task_id))
+                                 expected_run_id=_worker_run_id_for(args.task_id, "heartbeat"))
     return _ok_or_err(ok, f"cannot heartbeat {args.task_id} (not running?)",
                       f"Heartbeat recorded for {args.task_id}")
 
@@ -708,7 +708,7 @@ def _cmd_link(args: argparse.Namespace) -> int:
     # A worker linking its own running card (dependency-block handoff) proves
     # ownership with its run id; linking a foreign task never needs one.
     expected_child_run_id = (
-        _worker_run_id_for(args.child_id)
+        _worker_run_id_for(args.child_id, "link")
         if args.child_id == os.environ.get("HERMES_KANBAN_TASK") else None)
     with kbc.connect_closing() as conn:
         gated = kb.link_tasks(conn, args.parent_id, args.child_id,
@@ -766,7 +766,7 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     """Attach a local file via the shared ``store_attachment_bytes`` path (same 25 MB cap and name
     sanitisation as the dashboard upload and agent tool)."""
     import mimetypes
-    _worker_run_id_for(args.task_id)
+    _worker_run_id_for(args.task_id, "attach")
 
     src = Path(args.path).expanduser()
     if not src.is_file():
@@ -812,10 +812,29 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
     return 0
 
 
-def _worker_run_id_for(task_id: str) -> Optional[int]:
+def _worker_run_id_for(task_id: str, action: str) -> Optional[int]:
+    """This worker's dispatcher run id when it is scoped to ``task_id``; ``None``
+    for CLI/human/orchestrator callers (no ``HERMES_KANBAN_TASK``).
+
+    ``action`` is the CLI subcommand name (``"complete"``, ``"block"``, ...). A
+    worker scoped to a DIFFERENT task that genuinely needs to close/mutate this
+    one (a verified duplicate, finished work filed under another id, an
+    auto-escalated status mismatch about a card it owns) cannot do it itself —
+    the scoping gate stays absolute, no cross-task authority is granted here.
+    What was missing was telling it (and the human reading the resulting block)
+    the concrete non-worker route instead of only the refusal, which otherwise
+    leaves the ask parked on the digest with no way to close it (t_b9361ca4).
+    """
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
     if env_tid and env_tid != task_id:
-        raise ValueError(f"worker is scoped to task {env_tid}; refusing to mutate {task_id}")
+        board = os.environ.get("HERMES_KANBAN_BOARD")
+        board_flag = f"--board {board} " if board else ""
+        raise ValueError(
+            f"worker is scoped to task {env_tid}; refusing to mutate {task_id}. "
+            f"A worker cannot act across cards, even for a legitimate reason. "
+            f"Route: from a shell with no HERMES_KANBAN_TASK set (not a "
+            f"dispatcher worker), run `hermes kanban {board_flag}{action} {task_id}`."
+        )
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if os.environ.get("HERMES_KANBAN_TASK") != task_id or not raw:
         return None
@@ -920,7 +939,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                        expected_run_id=_worker_run_id_for(tid),
+                                        expected_run_id=_worker_run_id_for(tid, "complete"),
                                         force=bool(getattr(args, "force", False)))
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
@@ -1005,7 +1024,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
             return f"Blocked {tid}{suffix}"
 
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid),
+            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid, "block"),
             metadata=metadata))
         return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
 
@@ -1017,7 +1036,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
         op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid, "schedule")))
         return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
 
 
@@ -1051,7 +1070,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+            expected_run_id=_worker_run_id_for(tid, "request-review"), force=bool(getattr(args, "force", False)), with_reason=True)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)
@@ -1064,7 +1083,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kbc.connect_closing() as conn:
-        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
+        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid, "request-changes"))
         if not ok:
             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))

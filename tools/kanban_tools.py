@@ -247,7 +247,22 @@ def _stamp_worker_session_metadata(task_id: str, metadata: Optional[dict]) -> Op
     return {**(metadata or {}), "worker_session_id": session_id} if session_id else metadata
 
 
-def _enforce_worker_task_ownership(tid: str) -> None:
+_TOOL_TO_CLI_VERB = {
+    "kanban_complete": "complete",
+    "kanban_block": "block",
+    "kanban_schedule": "schedule",
+    "kanban_request_review": "request-review",
+    "kanban_request_changes": "request-changes",
+    "kanban_heartbeat": "heartbeat",
+    "kanban_attach": "attach",
+    # kanban_attach_url has no CLI verb of its own; "attach" is the closest
+    # non-worker route (download the URL locally first, then attach the file).
+    "kanban_attach_url": "attach",
+    "kanban_unblock": "unblock",
+}
+
+
+def _enforce_worker_task_ownership(tid: str, tool_name: str = "complete") -> None:
     """A dispatcher-spawned worker may only mutate its own HERMES_KANBAN_TASK; a
     prompt-injected ``task_id`` must not corrupt sibling/cross-tenant runs.
     Orchestrators (toolset enabled, no env task) legitimately route child tasks.
@@ -255,12 +270,25 @@ def _enforce_worker_task_ownership(tid: str) -> None:
     Tools like ``kanban_complete`` / ``kanban_block`` / ``kanban_heartbeat`` mutate run-lifecycle state, so
     a buggy or prompt-injected worker that passed an explicit ``task_id`` for some other task could corrupt
     sibling or cross-tenant runs (see #19534).
+
+    A worker that genuinely NEEDS to close/mutate a sibling card (a verified duplicate,
+    finished work filed under another id, an auto-escalated status-mismatch card it owns)
+    still cannot do it from here — the scoping gate stays absolute, no cross-task authority
+    is granted. What it was missing was a concrete non-worker route instead of only the
+    refusal, which otherwise leaves the ask parked on the digest forever (t_b9361ca4): the
+    error now names the CLI command a human runs from an unscoped shell.
     """
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
     if env_tid and tid != env_tid:
+        board = os.environ.get("HERMES_KANBAN_BOARD")
+        board_flag = f"--board {board} " if board else ""
+        verb = _TOOL_TO_CLI_VERB.get(tool_name, "complete")
         raise _Reject(
             f"worker is scoped to task {env_tid}; refusing to mutate {tid}. Use kanban_comment "
-            f"to hand off information to other tasks, or kanban_create to spawn follow-up work.")
+            f"to hand off information to other tasks, or kanban_create to spawn follow-up work. "
+            f"If this genuinely needs to be done now (verified duplicate, finished work filed "
+            f"under another id), the route is: from a shell with no HERMES_KANBAN_TASK set (not "
+            f"a dispatcher worker), run `hermes kanban {board_flag}{verb} {tid}`.")
 
 
 def _worker_guard(tool_name: str, args: dict) -> str:
@@ -281,7 +309,7 @@ def _worker_guard(tool_name: str, args: dict) -> str:
     """
     _reject_delegated_child_mutation(tool_name)
     tid = _require_task_id(args)
-    _enforce_worker_task_ownership(tid)
+    _enforce_worker_task_ownership(tid, tool_name)
     if (
         tool_name in _RUN_LIFECYCLE_TOOLS
         and os.environ.get("HERMES_KANBAN_TASK")
@@ -1271,7 +1299,7 @@ def _handle_unblock(args: dict, **kw) -> str:
     tid = args.get("task_id")
     _check(tid, "task_id is required")
     tid = str(tid)
-    _enforce_worker_task_ownership(tid)
+    _enforce_worker_task_ownership(tid, "kanban_unblock")
     with _board(args.get("board")) as (kb, conn):
         _check(kb.unblock_task(conn, tid), f"could not unblock {tid} (not blocked or unknown)")
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
