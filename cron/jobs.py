@@ -1785,6 +1785,49 @@ def _next_run_or_reject_past_oneshot(
     return next_run_at
 
 
+def _validate_create_time_model_pin(
+    provider: Optional[str], model: Optional[str], job_id: str, job_name: Optional[str],
+) -> None:
+    """Creation-time echo of cron.scheduler._validate_resolved_model (12 Nov retro, t_5d757b4d /
+    t_be7b266e): a job that schedules a FOLLOW-UP job with an explicit --model pin missing its
+    vendor prefix (e.g. 'sonnet-5' for anthropic) used to fail loud only when the follow-up
+    finally ran — in that incident, 9 hours after it was created malformed, with nobody watching.
+    The creating call already has a live session; it can validate the string it is about to hand
+    the scheduler instead of waiting for dispatch time.
+
+    Only engages when THIS create/update call pins a model (an unpinned job inherits
+    cron.model / model.default at run time, which this guard assumes is already sane — the
+    run-time guard still re-checks it every tick regardless). Provider resolution here is
+    DELIBERATELY shallow and static — per-job pin > cron.model_provider > config.yaml's
+    model.provider — mirroring the actual 12 Nov incident (job.provider was None, config.yaml's
+    static ``model: {provider: anthropic}`` is what the dispatcher resolved onto). It never walks
+    the live credential/OAuth ladder (``resolve_runtime_provider``'s pool/fallback rungs): that
+    ladder's outcome depends on which credentials happen to be present on this host today, so
+    using it here would make this guard flaky across environments and risk false-failing on
+    legitimate placeholder model names in tests. Any config read failure is swallowed — this is a
+    sanity check, not a config validator, so it fails open (skips) rather than blocking creation
+    for an unrelated reason."""
+    if not model:
+        return
+    resolved_provider = provider
+    if not resolved_provider:
+        with contextlib.suppress(Exception):
+            from hermes_cli.config_effective import load_user_config_effective
+            cfg_path = get_hermes_home() / "config.yaml"
+            cfg = load_user_config_effective(cfg_path) if cfg_path.exists() else {}
+            cron_cfg = cfg.get("cron") or {}
+            if isinstance(cron_cfg, dict):
+                resolved_provider = str(cron_cfg.get("model_provider") or "").strip() or None
+            if not resolved_provider:
+                model_cfg = cfg.get("model") or {}
+                if isinstance(model_cfg, dict):
+                    resolved_provider = str(model_cfg.get("provider") or "").strip() or None
+    if not resolved_provider:
+        return
+    from cron.scheduler import _validate_resolved_model
+    _validate_resolved_model(resolved_provider, model, job_id, job_name or job_id)
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1863,6 +1906,9 @@ def create_job(
     name = name or label_source[:50].strip()
     if pinned and not f["model"]:
         f["provider"], f["model"] = _main_model_pin()
+    # Catch a malformed --model/--provider pin NOW, before the job is persisted, instead of
+    # waiting for it to fire and die hours (or days) later with nobody watching (t_5d757b4d).
+    _validate_create_time_model_pin(f["provider"], f["model"], job_id, name)
     next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, name, schedule, "")
 
     job = {
@@ -2107,6 +2153,12 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        # Same creation-time guard as create_job: `hermes cron edit --model` / `--pinned` is the
+        # other place a malformed vendor-prefix pin gets typed in, and it deserves the same
+        # immediate rejection instead of waiting for the next tick (t_5d757b4d).
+        if {"model", "provider", "pinned"}.intersection(updates):
+            _validate_create_time_model_pin(
+                updated.get("provider"), updated.get("model"), job_id, updated.get("name"))
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
