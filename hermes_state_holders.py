@@ -13,6 +13,7 @@ import logging
 import os
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Set, Tuple
 
@@ -55,6 +56,49 @@ def _read_proc_argv(pid: int) -> Optional[list[str]]:
         return argv or None
     except OSError:
         return None
+
+
+# A process stuck in an uninterruptible D-state (wedged NFS mount, stuck kernel
+# mm lock, ...) makes the plain open()/read() in _read_proc_argv() above block
+# forever with no exception and no way to interrupt it -- not even SIGKILL
+# reaches a thread parked in that syscall. Bounding the WAIT (below) rather
+# than trying to bound the syscall itself is the only lever Python has here.
+_PROC_ARGV_READ_TIMEOUT_S = 2.0
+
+
+def _read_proc_argv_bounded(
+    pid: int, timeout: Optional[float] = None
+) -> Tuple[Optional[list[str]], bool]:
+    """``(_read_proc_argv(pid), timed_out)`` with a wall-clock bound on the read.
+
+    Runs the read on a daemon thread and gives up after *timeout* seconds
+    (module-level ``_PROC_ARGV_READ_TIMEOUT_S`` when omitted -- resolved at
+    call time, not baked in as a default argument, so tests can shrink it with
+    a plain ``monkeypatch.setattr`` instead of re-patching every call site). A
+    hung read leaves its thread parked forever (it cannot be killed -- a
+    D-state read ignores signals same as it ignores everything else) but the
+    caller is freed either way, which is the actual goal: scanning the rest of
+    /proc must not wait on ANY single pid. ``timed_out=True`` means exactly
+    "still blocked after *timeout*s", distinct from the plain ``OSError`` case
+    (process already gone / genuinely unreadable) that ``_read_proc_argv``
+    itself reports as a clean ``None`` -- a live, wedged process is the
+    opposite story from an exited one, and callers must not conflate them.
+    """
+    if timeout is None:
+        timeout = _PROC_ARGV_READ_TIMEOUT_S
+    outcome: list[Optional[list[str]]] = [None]
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            outcome[0] = _read_proc_argv(pid)
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, name=f"proc-argv-read-{pid}", daemon=True).start()
+    if done.wait(timeout):
+        return outcome[0], False
+    return None, True
 
 
 def describe_holder_pid(pid: int) -> str:
@@ -472,8 +516,17 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                 try:
                     fds = os.listdir(fd_dir)
                 except OSError:
-                    argv = _read_proc_argv(pid)
-                    if (
+                    argv, timed_out = _read_proc_argv_bounded(pid)
+                    if timed_out:
+                        holders.append(
+                            (
+                                pid,
+                                "uninspectable holder: /proc/"
+                                f"{pid}/cmdline read exceeded {_PROC_ARGV_READ_TIMEOUT_S:g}s "
+                                "(process may be wedged in D-state)",
+                            )
+                        )
+                    elif (
                         argv is not None
                         and _looks_like_hermes(argv)
                         and not _argv_scoped_to_other_home(argv, db_path)
@@ -488,8 +541,17 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                     except OSError as exc:
                         if exc.errno in (errno.ENOENT, errno.ESRCH):
                             continue
-                        argv = _read_proc_argv(pid)
-                        if (
+                        argv, timed_out = _read_proc_argv_bounded(pid)
+                        if timed_out:
+                            holders.append(
+                                (
+                                    pid,
+                                    f"uninspectable descriptor: {fd_path}: "
+                                    f"cmdline read exceeded {_PROC_ARGV_READ_TIMEOUT_S:g}s "
+                                    "(process may be wedged in D-state)",
+                                )
+                            )
+                        elif (
                             argv is not None
                             and _looks_like_hermes(argv)
                             and not _argv_scoped_to_other_home(argv, db_path)
@@ -512,8 +574,18 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                                 (pid, f"uninspectable descriptor: {target}: {exc}")
                             )
                         else:
-                            argv = _read_proc_argv(pid)
-                            if (
+                            argv, timed_out = _read_proc_argv_bounded(pid)
+                            if timed_out:
+                                holders.append(
+                                    (
+                                        pid,
+                                        "uninspectable descriptor: "
+                                        f"{target}: cmdline read exceeded "
+                                        f"{_PROC_ARGV_READ_TIMEOUT_S:g}s "
+                                        "(process may be wedged in D-state)",
+                                    )
+                                )
+                            elif (
                                 argv is not None
                                 and _looks_like_hermes(argv)
                                 and not _argv_scoped_to_other_home(argv, db_path)
