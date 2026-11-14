@@ -252,6 +252,78 @@ def count_notify_subs(
         conn.close()
 
 
+def tasks_needing_fallback_subscription(
+    db_path: Optional[Path] = None, *, board: Optional[str] = None, kinds: Iterable[str],
+) -> list[str]:
+    """Read-only: ids of tasks that are CURRENTLY ``blocked`` and have an event whose
+    kind is in ``kinds`` and zero rows in ``kanban_notify_subs``.
+
+    Not wired into the notifier — see incident t_d79e0587. Kept as a correct, tested
+    primitive for a possible future orphan-event path, with the bug that caused the
+    incident fixed: the original version matched on event history alone with no
+    ``tasks.status`` filter, so a task that was briefly ``blocked`` months ago and is
+    now ``done``/``archived`` matched forever. Scoping to currently-``blocked`` means a
+    task that progressed past the stuck state (including one the archive-on-delivery
+    path in the notifier just unsubscribed) can never re-qualify and loop.
+    """
+    path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    if not path.exists():
+        return []
+    kind_list = [str(k) for k in kinds]
+    if not kind_list:
+        return []
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        query = (
+            "SELECT DISTINCT te.task_id FROM task_events te "
+            "JOIN tasks t ON t.id = te.task_id "
+            "WHERE te.kind IN (" + ",".join("?" * len(kind_list)) + ") "
+            "AND t.status = 'blocked' "
+            "AND NOT EXISTS (SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = te.task_id)"
+        )
+        try:
+            rows = conn.execute(query, kind_list).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return []
+            raise
+        return [str(r[0]) for r in rows]
+    finally:
+        conn.close()
+
+
+def add_fallback_notify_subs(
+    conn: sqlite3.Connection, *, task_id: str, routes: Iterable[tuple[str, str]],
+    notifier_profile: Optional[str] = None,
+) -> bool:
+    """Create notify-only subscriptions for a task currently believed sub-less, one per
+    ``(platform, chat_id)`` route.
+
+    Not wired into the notifier — see incident t_d79e0587. Kept as a correct, tested
+    primitive for a possible future orphan-event path, with the bug that caused the
+    incident fixed: the original version hardcoded ``last_event_id = 0``, replaying a
+    task's entire history on first delivery; this delegates to :func:`add_notify_sub`,
+    which always starts a new sub caught up (``last_event_id = MAX(task_events.id)``),
+    so only the event that triggers the fallback onward is ever delivered. Callers are
+    responsible for excluding any platform in
+    ``gateway.config.NEVER_AUTO_SUBSCRIBE_PLATFORMS`` from ``routes`` themselves — this
+    function has no config access and cannot enforce that; use
+    ``GatewayConfig.get_unattended_fallback_home_channel`` to build ``routes``, never
+    ``get_home_channel`` directly, for any unattended caller.
+    """
+    routes = [(str(p), str(c)) for p, c in routes if c]
+    if not routes:
+        return False
+    created = False
+    for platform, chat_id in routes:
+        add_notify_sub(
+            conn, task_id=task_id, platform=platform, chat_id=chat_id,
+            notifier_profile=notifier_profile, delivery_mode="notify",
+        )
+        created = True
+    return created
+
+
 def remove_notify_sub(
     conn: sqlite3.Connection,
     *,

@@ -404,6 +404,18 @@ PLATFORM_TOKEN_ENV_NAMES: dict[Platform, str] = {
     Platform.WEIXIN: "WEIXIN_TOKEN",
 }
 
+# Platforms an unattended background process (notifier, cron, dispatcher — anything
+# with no human command and no live agent session behind the chat) must never write a
+# subscription row for on its own initiative, no matter how the destination was
+# configured. See ``GatewayConfig.get_unattended_fallback_home_channel`` (the only
+# sanctioned read site) and incident t_d79e0587: a 2026-11-14 "home-channel fallback"
+# bug (79e27143583, reverted) auto-subscribed the owner's Signal to ~260 historical
+# cards and replayed their full event history, because the fallback read the plain
+# per-platform home channel instead of this blocklist. Deliberately a blocklist, not
+# an allowlist: a newly added platform defaults to eligible, which is correct — only
+# Signal is the owner's single direct personal line.
+NEVER_AUTO_SUBSCRIBE_PLATFORMS: frozenset[Platform] = frozenset({Platform.SIGNAL})
+
 
 @dataclass
 class PlatformConfig:
@@ -689,6 +701,26 @@ class GatewayConfig:
 
     def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
         return self.platforms[platform].home_channel if self.platforms.get(platform) else None
+
+    def get_unattended_fallback_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
+        """``get_home_channel`` for any code path that auto-subscribes a destination to
+        unattended events (no human typed a command, no agent session is behind the
+        chat) rather than delivering to a session already in flight.
+
+        Standing rule (incident t_d79e0587, 2026-11-14): the owner's Signal is his one
+        direct personal line and is NEVER auto-subscribed to a card — decisions reach
+        him through a digest/ACT note from a reviewing profile, not raw board events.
+        A home channel on any platform in ``NEVER_AUTO_SUBSCRIBE_PLATFORMS`` is a valid
+        *manual* notify target (``/kanban notify-subscribe`` from a live chat still
+        works, see ``get_home_channel``) but must never be a destination an unattended
+        background process writes a subscription row for on its own initiative. Route
+        unattended-orphan events to a team/local channel instead; see the incident
+        writeup for why starting with a wide blocklist (just Signal, for now) beats a
+        narrow allowlist that a new platform silently falls outside of.
+        """
+        if platform in NEVER_AUTO_SUBSCRIBE_PLATFORMS:
+            return None
+        return self.get_home_channel(platform)
 
     def to_dict(self) -> dict[str, Any]:
         return {
