@@ -60,9 +60,13 @@ def test_real_dispatcher_lifecycle(tmp_path, mode):
     import subprocess
     import sys
     repo = Path(__file__).resolve().parents[2]
-    from tests.gateway.fixtures.local_recovery_probe import child_env
+    from tests.gateway.fixtures.local_recovery_probe import child_env, seed_shared_uv_cache
     env = child_env()
     env.update(HOME=str(tmp_path / 'home'), USERPROFILE=str(tmp_path / 'home'), HERMES_HOME=str(tmp_path / 'state'), PYTHONPATH=str(repo), KANBAN_PROBE_MODE=mode)
+    # This dispatches a kanban task to a worker that provisions its own pm-managed
+    # venv; without a shared uv cache each of the 5 parametrised runs rebuilds a
+    # fresh ~900MB venv into this disposable tmp_path (t_43e9dd1e).
+    seed_shared_uv_cache(env['HERMES_HOME'])
     result = subprocess.run([sys.executable, str(Path(__file__).parent / 'fixtures' / 'kanban_owner_probe.py')],
         env=env, cwd=repo, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=150, check=False)
     assert result.returncode == 0, result.stdout + result.stderr

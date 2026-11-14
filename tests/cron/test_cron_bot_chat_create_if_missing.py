@@ -13,7 +13,7 @@ import threading
 
 import pytest
 
-from tests.gateway.fixtures.local_recovery_probe import Model, child_env, daemon
+from tests.gateway.fixtures.local_recovery_probe import Model, child_env, daemon, seed_shared_uv_cache
 
 
 @pytest.mark.platforms("linux")
@@ -38,6 +38,10 @@ def test_cron_bot_chat_delivery_creates_the_missing_bot_chat_and_admits(tmp_path
                    OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url, PYTHONUNBUFFERED='1')
         monkeypatch.setenv('HERMES_HOME', str(home))
         monkeypatch.setattr(Path, 'home', lambda: user)
+        # This delivery path dispatches a kanban task to a worker that provisions
+        # its own pm-managed venv; without a shared uv cache it rebuilds a fresh
+        # ~900MB venv into this disposable tmp_path every run (t_43e9dd1e).
+        seed_shared_uv_cache(home)
         with daemon(root, home, env, barrier=False):
             from cron.scheduler_delivery import _deliver_to_bot_chat
             job = {'id': 'digest', 'name': 'Digest', 'execution_id': 'run-1'}

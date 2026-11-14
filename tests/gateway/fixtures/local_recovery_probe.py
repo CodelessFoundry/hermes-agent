@@ -82,6 +82,35 @@ def seed_offline_models_dev(home):
             cache.write_text(json.dumps({'hermes-test-offline': {'id': 'hermes-test-offline', 'env': [], 'models': {}}}))
 
 
+def seed_shared_uv_cache(hermes_home):
+    """Symlink a fresh/isolated HERMES_HOME's uv cache onto one shared,
+    persistent directory outside tmp_path.
+
+    pm.packages.uv_cache_dir() resolves to get_default_hermes_root() / "cache"
+    / "uv" — i.e. it follows whatever HERMES_HOME the calling process has, not
+    an ambient UV_CACHE_DIR env var (managed_environment() overwrites that
+    unconditionally once it reaches uv). Any test that isolates HERMES_HOME
+    under tmp_path *and* drives a real package-manager install (dispatching a
+    kanban task to a worker that provisions its own pm-managed venv) rebuilds
+    uv's full download+wheel cache from scratch into that disposable tmp_path
+    every single run: ~900MB-1GB per parametrised case, never reused, because
+    the next run gets a fresh tmp_path and a fresh empty cache again.
+    Symlinking the cache subdir onto one persistent location restores the
+    sharing pm's own uv_cache_dir() docstring says is "machine-scoped and
+    shared" and "concurrency-safe" — the seeded wheels/venvs just get
+    hardlinked in on every call instead of re-downloaded. See t_43e9dd1e.
+    """
+    # os.path.expanduser, not Path.home(): some callers monkeypatch Path.home for the
+    # probe's own isolation and this must stay anchored to the real test-runner home.
+    shared = Path(os.environ.get('HERMES_TEST_UV_CACHE', '') or os.path.join(os.path.expanduser('~'), '.cache', 'hermes-test-uv-shared'))
+    shared.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(hermes_home) / 'cache'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    link = cache_dir / 'uv'
+    if not link.exists():
+        link.symlink_to(shared, target_is_directory=True)
+
+
 @contextmanager
 def daemon(root, home, env, *, barrier, fixture='local_recovery_daemon.py'):
     seed_offline_models_dev(env.get('HERMES_HOME', home))
