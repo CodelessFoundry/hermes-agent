@@ -27,7 +27,7 @@ class Model(BaseModel):
 def main():
     root = Path(__file__).resolve().parents[3]
     home = Path(os.environ['HERMES_HOME'])
-    home.mkdir(parents=True)
+    home.mkdir(parents=True, exist_ok=True)
     user = Path(os.environ['HOME'])
     user.mkdir(parents=True)
     mode = os.environ['KANBAN_RECOVERY_MODE']
