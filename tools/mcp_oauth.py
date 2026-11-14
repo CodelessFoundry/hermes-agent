@@ -8,6 +8,8 @@ Document URL (CIMD) when the server supports it, else RFC 7591 DCR. ``mcp_server
 (all optional): client_id, client_secret, scope, redirect_port, redirect_uri (proxy callback),
 redirect_host, client_name, client_metadata_url, cimd, user_agent, timeout."""
 
+from __future__ import annotations
+
 from pm import install_hint
 import asyncio
 import contextlib
