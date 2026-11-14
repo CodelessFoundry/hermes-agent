@@ -1,8 +1,11 @@
 """Construction-time state.db maintenance must keep the startup watchdog's progress lease alive (#111092).
 
-Archive, prune, orphan sweep and VACUUM are I/O-bound with near-zero CPU, so the watchdog's
-CPU fallback cannot tell them from a parked deadlock; only a phase lease can. Leases are
-clamped to ``_MAX_LEASE_S`` per call, so each long step renews rather than one lease at entry.
+Archive, prune, orphan sweep, the pre-VACUUM foreign/in-process holder scan, and VACUUM itself
+are all I/O-bound with near-zero CPU, so the watchdog's CPU fallback cannot tell them from a
+parked deadlock; only a phase lease can. Leases are clamped to ``_MAX_LEASE_S`` per call, so each
+long step renews rather than one lease at entry (t_3643e8c8: the holder scan originally had no
+lease of its own and could outlive the sweep step's lease under host CPU contention, triggering a
+false-positive watchdog kill of a startup that was still making legitimate progress).
 """
 
 from __future__ import annotations
@@ -32,9 +35,10 @@ def test_maintenance_steps_renew_the_armed_watchdog_lease(tmp_path, monkeypatch)
             retention_days=90, min_interval_hours=0, vacuum=True, min_vacuum_interval_days=0,
         )
 
-        # One renewal per long step (archive, prune, sweep, vacuum), the last one
-        # taken right before VACUUM so a multi-minute rewrite never outlives the clamp.
-        assert handle._lease_count - before == 4
+        # One renewal per long step (archive, prune, sweep, holder scan, vacuum), the
+        # last one taken right before VACUUM so a multi-minute rewrite never outlives
+        # the clamp.
+        assert handle._lease_count - before == 5
         assert handle._lease_phase == "state_db_auto_vacuum"
         assert handle._lease_until > time.monotonic()
     finally:

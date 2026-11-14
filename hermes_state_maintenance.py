@@ -547,6 +547,14 @@ class SessionMaintenanceMixin:
                 # one multiplexed process another live SessionDB generation for this same path is
                 # just as much a holder as another process would be.
                 # Automatic maintenance only ever SKIPS — a turn is never refused over housekeeping.
+                # Startup-watchdog lease: foreign_state_db_holders() walks every PID's fd table on
+                # Linux (os.listdir + readlink/stat per fd) — unbounded, near-zero CPU of its own,
+                # and its cost scales with whatever else the host is running, not with state.db size.
+                # It inherited no lease of its own (gap found in t_3643e8c8): under sustained host
+                # CPU contention it can outlive the sweep step's lease from line ~530, and the
+                # watchdog then sees neither an active lease nor CPU progress on this thread and
+                # kills a startup that was still making legitimate progress.
+                report_startup_progress(900.0, phase="state_db_auto_vacuum_holder_scan")
                 from hermes_state_holders import (
                     foreign_state_db_holders, in_process_state_db_holders)
                 holders = (foreign_state_db_holders(self.db_path)
