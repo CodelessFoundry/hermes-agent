@@ -777,6 +777,20 @@ markers = [
 ]
 # integration tests take way too long to run in the normal CI environments
 addopts = "-m 'not integration and not live'"
+# Bound tmp_path/basetemp accumulation by SIZE, not just count. pytest's
+# default (policy="all", count=3) keeps the 3 most recent basetemps
+# regardless of how large each one is — three ~6G e2e runs (daemon/lazy-
+# install tests that each build a fresh uv venv) are enough to fill a 58G
+# root disk, which is exactly what happened overnight 2026-11-07 (18G across
+# pytest-18/19/24, root hit 92%/4.8G free, cron dispatch failed with
+# "database or disk is full"). "failed" drops a passing run's basetemp the
+# moment the session ends, so only genuinely-needed debug artifacts (failed
+# runs) are retained, still capped at tmp_path_retention_count below. This
+# is independent of TMPDIR/shell environment, so it holds even for the
+# non-interactive/non-login invocations (cron scopes, CI runners) that never
+# source ~/.bashrc or ~/.profile. See t_2aa966c0.
+tmp_path_retention_policy = "failed"
+tmp_path_retention_count = 2
 
 [tool.ty.environment]
 python-version = "3.13"
