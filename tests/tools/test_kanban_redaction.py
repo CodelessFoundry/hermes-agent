@@ -35,9 +35,11 @@ def worker_env(monkeypatch, tmp_path):
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
+        run_id = kb._current_run_id(conn, tid)
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
     return tid
 
 
@@ -82,6 +84,7 @@ def test_kanban_block_reason_scrubbed_jwt(worker_env):
         conn.close()
     # block_task stores reason as run.summary
     assert run is not None
+    assert run.outcome == "blocked"
     stored = run.summary or ""
     assert jwt not in stored
 
@@ -144,5 +147,59 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     finally:
         conn.close()
     assert run is not None
-    stored = run.summary or run.result if hasattr(run, "result") else run.summary or ""
-    assert secret not in (stored or "")
+    assert run.outcome == "completed"
+    stored = run.summary or ""
+    assert secret not in stored
+
+
+def test_kanban_create_body_scrubbed_api_key(worker_env):
+    """sk- key in a kanban_create body must be masked before the DB write.
+
+    _handle_create was the only one of the five kanban write paths that
+    persisted free text verbatim (#92354) — every other path already
+    called redact_sensitive_text(force=True)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    secret = "sk-" + "a" * 30
+    out = json.loads(kt._handle_create({
+        "title": f"rotate {secret} now",
+        "assignee": "test-worker",
+        "body": f"complete using {secret}",
+    }))
+    assert out["ok"] is True
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, out["task_id"])
+    finally:
+        conn.close()
+    assert task is not None
+    assert secret not in (task.body or "")
+    # Head/tail mask survives for debuggability (same rule as other paths).
+    assert "sk-" in (task.body or "")
+    # Titles are free text too and masked under the same contract —
+    # a key pasted into a title would otherwise survive in board listings
+    # and dispatcher logs (review follow-up on #92354).
+    assert secret not in (task.title or "")
+    assert "sk-" in (task.title or "")
+
+
+def test_kanban_create_secret_free_body_passthrough(worker_env):
+    """A secret-free body must pass through byte-for-byte."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    body = "Investigate the flaky e2e suite and report findings."
+    out = json.loads(kt._handle_create({
+        "title": "plain task",
+        "assignee": "test-worker",
+        "body": body,
+    }))
+    assert out["ok"] is True
+    conn = kbc.connect()
+    try:
+        task = kb.get_task(conn, out["task_id"])
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.body == body
