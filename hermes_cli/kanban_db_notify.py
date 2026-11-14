@@ -252,6 +252,82 @@ def count_notify_subs(
         conn.close()
 
 
+def tasks_needing_fallback_subscription(
+    db_path: Optional[Path] = None, *, board: Optional[str] = None, kinds: Iterable[str],
+) -> list[str]:
+    """Read-only: distinct task ids with an event whose kind is in ``kinds`` and zero rows in
+    ``kanban_notify_subs`` — the notifier's home-channel fallback gate (see
+    :func:`add_fallback_notify_subs`). Mirrors :func:`count_notify_subs`'s read-only style: never
+    creates the file or opens writable, missing DB/table counts as none.
+    """
+    path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    if not path.exists():
+        return []
+    kind_list = [str(k) for k in kinds]
+    if not kind_list:
+        return []
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        query = (
+            "SELECT DISTINCT te.task_id FROM task_events te "
+            "WHERE te.kind IN (" + ",".join("?" * len(kind_list)) + ") "
+            "AND NOT EXISTS (SELECT 1 FROM kanban_notify_subs s WHERE s.task_id = te.task_id)"
+        )
+        try:
+            rows = conn.execute(query, kind_list).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return []
+            raise
+        return [str(r[0]) for r in rows]
+    finally:
+        conn.close()
+
+
+def add_fallback_notify_subs(
+    conn: sqlite3.Connection, *, task_id: str, routes: Iterable[tuple[str, str]],
+    notifier_profile: Optional[str] = None,
+) -> bool:
+    """Create one-time home-channel subscriptions for a task that currently has zero
+    subscribers of any kind — the notifier's board-wide silent-timeout fallback.
+
+    Unlike :func:`add_notify_sub` (which starts a new sub "caught up", deliberately
+    skipping history), this starts the cursor at 0 so the event that triggered the
+    fallback — and the task's prior history — is delivered on the very next claim; a
+    task that nobody was ever watching should hand its whole story to whoever picks it
+    up now, not just events from this moment forward. Re-checks under the write lock
+    that the task is still subless: a real subscription (manual ``notify-subscribe`` or
+    the chat-command auto-subscribe) winning the race must never be duplicated or have
+    its cursor clobbered. ``routes`` is an iterable of ``(platform, chat_id)`` pairs,
+    one row per platform with a configured, enabled home channel. ``delivery_mode`` is
+    plain ``notify`` (a passive push to a human), never ``notify+wake`` — there is no
+    agent session behind a home channel to resume.
+    """
+    routes = [(str(p), str(c)) for p, c in routes if c]
+    if not routes:
+        return False
+    with _kb.write_txn(conn):
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
+        ).fetchone()
+        if existing and int(existing[0]) > 0:
+            return False
+        created = False
+        for platform, chat_id in routes:
+            key = _sub_key(task_id, platform, chat_id, None)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO kanban_notify_subs
+                    (task_id, platform, chat_id, thread_id, chat_type, notifier_profile,
+                     delivery_mode, created_at, last_event_id)
+                VALUES (?, ?, ?, ?, 'dm', ?, 'notify', ?, 0)
+                """,
+                (*key, notifier_profile, int(time.time())),
+            )
+            created = True
+    return created
+
+
 def remove_notify_sub(
     conn: sqlite3.Connection,
     *,

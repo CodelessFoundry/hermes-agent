@@ -49,6 +49,19 @@ TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "st
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
 
+# Subset of _WAKE_KINDS that still needs a HUMAN when nobody subscribed: a task
+# with zero rows in kanban_notify_subs gets no delivery at all today (there is no
+# other path — see module docstring), so an approval/review stall or dispatcher
+# give-up just times out silently board-wide. "completed"/"changes_requested" are
+# excluded on purpose: they are routine on a programmatically-created board (every
+# worker run completes something) and would turn the home channel into noise; the
+# kinds below are exactly the ones where a human decision or infra failure is
+# stranded with no other audience. Deliberately NOT gated by `diagnostic_event()` —
+# that helper calls a `needs_input` block an "owner decision" rather than
+# "diagnostic", but an unsubscribed needs_input approval request (the motivating
+# case for this fallback) is precisely what must reach a human.
+_FALLBACK_WAKE_KINDS = ("blocked", "block_loop_detected", "review_requested", "gave_up", "crashed", "timed_out")
+
 
 def diagnostic_event(ev) -> bool:
     """Infrastructure attention is distinct from an explicit owner decision."""
@@ -289,6 +302,60 @@ class _Collector:
                          slug, sorted(self.notifier_profiles))
         return count != 0
 
+    def _fallback_candidates(self, slug: str) -> list[str]:
+        """Read-only: task ids on ``slug`` with a fallback-worthy event and zero subs."""
+        try:
+            return _kbn().tasks_needing_fallback_subscription(board=slug, kinds=_FALLBACK_WAKE_KINDS)
+        except Exception as exc:
+            logger.debug("kanban notifier: fallback-candidate probe failed for board %s: %s", slug, exc)
+            return []
+
+    def _fallback_routes(self) -> list[tuple[str, str]]:
+        """``(platform_name, chat_id)`` for every enabled, connected platform with a configured
+        home channel — the destination(s) an orphaned wake-worthy event falls back to."""
+        config = getattr(self.runner, "config", None)
+        if config is None:
+            return []
+        from gateway.config import Platform
+        routes: list[tuple[str, str]] = []
+        for name in sorted(self.active_platforms):
+            try:
+                platform = Platform(name)
+            except ValueError:
+                continue
+            try:
+                platform_config = config.platforms.get(platform)
+                if not platform_config or not platform_config.enabled:
+                    continue
+                home = config.get_home_channel(platform)
+            except Exception as exc:
+                logger.debug("kanban notifier: home-channel lookup failed for %s: %s", name, exc)
+                continue
+            if home and home.chat_id:
+                routes.append((name, str(home.chat_id)))
+        return routes
+
+    def _create_fallback_subs(self, conn: Any, slug: str, task_ids: list[str]) -> None:
+        """Subscribe every orphaned fallback candidate to the home channel(s), once."""
+        if not task_ids:
+            return
+        routes = self._fallback_routes()
+        if not routes:
+            logger.debug("kanban notifier: board %s has %d orphaned task(s) needing fallback "
+                         "but no enabled platform has a home channel configured", slug, len(task_ids))
+            return
+        for task_id in task_ids:
+            try:
+                created = _kbn().add_fallback_notify_subs(
+                    conn, task_id=task_id, routes=routes, notifier_profile=self.notifier_profile)
+            except Exception as exc:
+                logger.warning("kanban notifier: home-channel fallback subscribe failed for %s on board %s: %s",
+                               task_id, slug, exc)
+                continue
+            if created:
+                logger.info("kanban notifier: %s on board %s had no subscribers; falling back to home "
+                            "channel(s) %s", task_id, slug, [p for p, _ in routes])
+
     def _gc_stale_subs(self, conn: Any, slug: str) -> None:
         """Best-effort stale-sub sweep: a failed sweep never blocks delivery; the next hourly gate retries."""
         try:
@@ -324,7 +391,12 @@ class _Collector:
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
-        if not self._board_has_subs(slug):
+        has_subs = self._board_has_subs(slug)
+        # Cheap read-only probe runs every tick (not just when has_subs is False): a
+        # board can have real subscriptions for OTHER tasks while THIS task has none —
+        # the silent-timeout gap is per-task, not per-board.
+        fallback_tasks = self._fallback_candidates(slug)
+        if not has_subs and not fallback_tasks:
             return
         try:
             conn = _kbc().connect(board=slug)
@@ -334,6 +406,8 @@ class _Collector:
         try:
             if self.gc_due:
                 self._gc_stale_subs(conn, slug)
+            if fallback_tasks:
+                self._create_fallback_subs(conn, slug, fallback_tasks)
             # No explicit init_db(): connect() already runs the migration once per
             # process, and init_db() would re-run it on a second connection racing
             # the first.
