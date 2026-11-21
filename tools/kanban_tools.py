@@ -336,13 +336,61 @@ def _require_orchestrator_tool(tool_name: str) -> None:
             "kanban_heartbeat, or kanban_comment for their assigned task.")
 
 
+def _reject_cross_board_arg_when_pinned(board: Optional[str], kb) -> None:
+    """``board=`` cannot re-bind a session whose ``HERMES_KANBAN_DB`` env var
+    already pins a specific file — the dispatcher sets this on every
+    kanban-dispatched worker (``kanban_db_dispatch.py``), and
+    ``kanban_db._board_path`` honours that env override unconditionally,
+    before it ever looks at a ``board=`` argument. A top-level session (cron,
+    interactive) never has ``HERMES_KANBAN_DB`` set, so ``board=`` genuinely
+    re-binds there and this check is a no-op.
+
+    Without this guard a mismatched ``board=`` on a pinned session is not
+    rejected: it silently lands on the pinned board (``kanban_create``) or
+    fails with a generic "unknown task"/"task not found" (``kanban_show``,
+    ``kanban_comment``) that reads as "wrong id", not "wrong board" — see
+    kanban:t_d43a06c6. Three workers independently burned ~72h re-confirming
+    ids by sqlite before concluding (wrongly) that cross-board access itself
+    was impossible.
+    """
+    requested = kb._normalize_board_slug(board)
+    if requested is None:
+        return  # no explicit board= — nothing to re-bind, nothing to reject
+    if not os.environ.get("HERMES_KANBAN_DB", "").strip():
+        return  # top-level session: board= legitimately re-binds, unchanged
+    # Prefer the raw HERMES_KANBAN_BOARD env var over get_current_board(): the
+    # dispatcher sets it to the exact slug it pinned (kanban_db_dispatch.py),
+    # and get_current_board() would otherwise fall back to 'default' if that
+    # board's directory were ever removed out from under a live worker —
+    # reporting a wrong/stale "bound to" board in the error is worse than a
+    # slightly defensive read of the env var the dispatcher itself wrote.
+    bound = kb._normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD")) or kb.get_current_board()
+    if requested != bound:
+        raise _Reject(
+            f"kanban: board={requested!r} is not available in this context. "
+            f"This session is pinned to board {bound!r} via HERMES_KANBAN_DB "
+            "(every kanban-dispatched worker is pinned to its own board at "
+            "spawn, and delegate_task children inherit the parent's pin) — "
+            "the board= argument cannot re-bind it. Cross-board access "
+            "requires a top-level session with no HERMES_KANBAN_DB override "
+            "(a cron pass, or an interactive/CLI session), not a board= "
+            "override from a worker. See daily-domain-audit skill, "
+            "references/cross-board-kanban-writes.md."
+        )
+
+
 @contextmanager
 def _board(board: Optional[str], *, quiet_close: bool = False):
     """``with _board(slug) as (kb, conn)``; lazy import so the module loads in non-kanban
     contexts. ``board=None`` keeps the env/symlink resolution chain; an explicit slug
-    overrides it per call. ``quiet_close`` swallows close() errors (best-effort bridges)."""
+    overrides it per call, UNLESS this session is already pinned to a board via
+    ``HERMES_KANBAN_DB`` (see ``_reject_cross_board_arg_when_pinned``), in which case a
+    mismatched slug is rejected with a message naming the real restriction rather than
+    silently landing on the pinned board or surfacing as a misleading "unknown task".
+    ``quiet_close`` swallows close() errors (best-effort bridges)."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
+    _reject_cross_board_arg_when_pinned(board, kb)
     conn = kbc.connect(board=board)
     try:
         yield kb, conn

@@ -1483,3 +1483,93 @@ class TestDefaultTaskId:
         assert kt._default_task_id("") == worker_env
         assert kt._default_task_id("   ") == worker_env
         assert kt._default_task_id(None) == worker_env
+
+
+# ---------------------------------------------------------------------------
+# board= on a HERMES_KANBAN_DB-pinned session (kanban:t_d43a06c6)
+# ---------------------------------------------------------------------------
+# Every kanban-dispatched worker has HERMES_KANBAN_DB pinned to its own board's
+# file by the dispatcher (kanban_db_dispatch.py). kanban_db._board_path() honours
+# that env override unconditionally, before ever looking at a board= argument —
+# so a worker passing board="some-other-board" used to get silently routed back
+# to its OWN board (kanban_create landing in the wrong place with no signal) or a
+# generic "task not found" (kanban_show/kanban_comment against a real id on the
+# other board, reading as "wrong id" instead of "wrong board"). These tests pin
+# HERMES_KANBAN_DB the same way the dispatcher does and assert the mismatch is
+# now rejected with a message naming the actual restriction.
+
+class TestCrossBoardArgWhenPinned:
+    def _pin(self, monkeypatch, tmp_path, board_slug):
+        """Simulate the dispatcher's worker env: HERMES_KANBAN_DB AND
+        HERMES_KANBAN_BOARD both pinned to the same board (kanban_db_dispatch.py
+        sets both together — see env["HERMES_KANBAN_DB"]/env["HERMES_KANBAN_BOARD"])."""
+        pinned_db = tmp_path / "pinned-kanban.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned_db))
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", board_slug)
+        return pinned_db
+
+    def test_mismatched_board_arg_is_rejected_not_ignored(self, monkeypatch, worker_env, tmp_path):
+        from tools import kanban_tools as kt
+        self._pin(monkeypatch, tmp_path, "harness")
+        out = json.loads(kt._handle_create({
+            "board": "tech", "title": "cross-board probe", "assignee": "someone",
+        }))
+        assert out.get("error"), out
+        assert "tech" in out["error"] and "harness" in out["error"]
+        assert "HERMES_KANBAN_DB" in out["error"]
+        # Must NOT read like the old "unknown task"/generic failure — the
+        # whole point is naming the real restriction.
+        assert "not found" not in out["error"].lower()
+        assert "unknown task" not in out["error"].lower()
+
+    def test_mismatched_board_arg_rejected_on_show(self, monkeypatch, worker_env, tmp_path):
+        """Same guard on the read path: a real id on another board must not
+        come back as a misleading 'task not found'."""
+        from tools import kanban_tools as kt
+        self._pin(monkeypatch, tmp_path, "harness")
+        out = json.loads(kt._handle_show({"board": "tech", "task_id": "t_doesnotmatter"}))
+        assert out.get("error"), out
+        assert "tech" in out["error"] and "harness" in out["error"]
+
+    def test_matching_board_arg_is_a_noop(self, monkeypatch, worker_env, tmp_path):
+        """board= equal to the pinned board must behave exactly as before —
+        this guard only fires on a genuine mismatch, so this call must get
+        past it (whatever happens next, e.g. "task not found" on an empty
+        board, is unrelated to this guard)."""
+        from tools import kanban_tools as kt
+        from hermes_cli import kanban_db as kb
+        kb.create_board("harness")
+        self._pin(monkeypatch, tmp_path, "harness")
+        out = json.loads(kt._handle_show({"board": "harness", "task_id": "t_whatever"}))
+        if out.get("error"):
+            assert "is not available in this context" not in out["error"], out
+            assert "HERMES_KANBAN_DB" not in out["error"], out
+
+    def test_board_arg_still_rebinds_outside_a_pinned_session(self, monkeypatch, tmp_path):
+        """No HERMES_KANBAN_DB set (a true top-level session) must keep
+        re-binding via board= exactly as it did before this fix — see
+        daily-domain-audit skill, references/cross-board-kanban-writes.md."""
+        monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        from pathlib import Path as _Path
+        monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+        from tools import kanban_tools as kt
+        from hermes_cli import kanban_db as kb
+        kb._INITIALIZED_PATHS.clear()
+        kb.create_board("tech")
+        out = json.loads(kt._handle_create({
+            "board": "tech", "title": "legit cross-board create", "assignee": "someone",
+        }))
+        assert out.get("ok") is True, out
+
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_db_connect as kbc
+        conn = kbc.connect(board="tech")
+        try:
+            assert kb.get_task(conn, out["task_id"]) is not None
+        finally:
+            conn.close()
